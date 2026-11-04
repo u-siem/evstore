@@ -1,0 +1,35 @@
+[package]
+name = "usiem-evstore"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Embedded, schema-aware, multi-tenant event store library for uSIEM: physically isolated tenants, fast ingest, compact storage and search."
+license = "MIT"
+readme = "README.md"
+keywords = ["siem", "security", "events", "storage", "embedded"]
+categories = ["database-implementations", "data-structures"]
+# Spikes are standalone experiment crates, not part of this package.
+exclude = ["spikes/"]
+
+# Follow uSIEM's rule when adding dependencies: named crates with shallow
+# dependency trees only.
+[dependencies]
+crc32fast = "1.4"
+memmap2 = "0.9"
+roaring = { version = "0.11", default-features = false, features = ["std"] }
+zstd = { version = "0.13", default-features = false }
+
+[features]
+# Test-only crash injection (`EVSTORE_CRASH_AT=<name>` aborts the process at
+# that point). Never enable in production builds.
+failpoints = []
+
+[dev-dependencies]
+
+# zstd's C code is painfully slow unoptimized; keep debug test runs fast.
+[profile.dev.package.zstd-sys]
+opt-level = 3
+
+[[test]]
+name = "crash"
+required-features = ["failpoints"]

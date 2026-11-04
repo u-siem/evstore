@@ -1,0 +1,14 @@
+[package]
+name = "fsync-rounds"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Spike: cost of one coordinated sync round over N per-tenant WAL files (risk R3)."
+
+# Standalone: not part of the usiem-evstore crate or its CI.
+[workspace]
+
+[dependencies]
+
+[profile.release]
+debug = false

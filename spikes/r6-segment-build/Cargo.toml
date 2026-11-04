@@ -1,0 +1,15 @@
+[package]
+name = "r6-segment-build"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Spike: ingest and segment-build cost per event of the evstore MVP on syslog-like records (risk R6)."
+
+# Standalone: not part of the usiem-evstore crate or its CI.
+[workspace]
+
+[dependencies]
+usiem-evstore = { path = "../.." }
+
+[profile.release]
+debug = false

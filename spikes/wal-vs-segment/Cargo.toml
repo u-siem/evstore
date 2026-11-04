@@ -1,0 +1,17 @@
+[package]
+name = "wal-vs-segment"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Spike: query latency on a tenant's WAL vs a columnar segment, by tenant size (WAL-to-segment threshold)."
+
+# Standalone: not part of the usiem-evstore crate or its CI.
+[workspace]
+
+[dependencies]
+ring = "0.17"
+serde_json = "1"
+zstd = "0.13"
+
+[profile.release]
+debug = false

@@ -1,0 +1,16 @@
+[package]
+name = "compression-dicts"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Spike: bytes per event by tenant size, with schema-grouped columns and pre-trained dictionaries (risk R1)."
+
+# Standalone: not part of the usiem-evstore crate or its CI.
+[workspace]
+
+[dependencies]
+serde_json = "1"
+zstd = "0.13"
+
+[profile.release]
+debug = false

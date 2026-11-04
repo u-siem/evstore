@@ -1,0 +1,18 @@
+[package]
+name = "wal-encryption"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Spike: cost of encrypting per-tenant WAL writes (crypto-erase design)."
+
+# Standalone: not part of the usiem-evstore crate or its CI.
+[workspace]
+
+[dependencies]
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+ring = "0.17"
+zstd = "0.13"
+
+[profile.release]
+debug = false
