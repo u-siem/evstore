@@ -26,3 +26,8 @@ Device flushes grow with rounds, not tenants. The interval adapts to load within
 **Files**:
 - **Preallocated WAL pool**, reused after **crypto-erase**: one key per WAL lifetime, discarded on release. Encryption is AES-256-GCM via `ring` behind an internal trait, with a counter nonce (the key is never reused). Measured cost: 1–4% of the ingest budget ([spike 03](../spikes/03-wal-encryption.md)).
 - An **LRU of open handles**; idle tenants keep nothing open.
+
+> Note (2026-11-06): one application already gets `WalSync` semantics without a store-level class. Its single writer
+> thread checks `Ack::synced` after `append`. When the batch carries waiters and is not yet synced, it calls
+> `Store::sync()` once for the whole batch, then releases the waiters. This works because one writer serialises
+> the appends, so the group commit happens there.
