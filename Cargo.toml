@@ -26,7 +26,7 @@ include = [
 crc32fast = "1.4"
 memmap2 = "0.9"
 roaring = { version = "0.11", default-features = false, features = ["std"] }
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 
 [features]
 # Test-only crash injection (`EVSTORE_CRASH_AT=<name>` aborts the process at
