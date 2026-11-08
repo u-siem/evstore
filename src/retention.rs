@@ -134,7 +134,7 @@ mod tests {
             min_age: Duration::ZERO,
         };
         // Day 10 ends at the start of day 11; one day later it expires.
-        assert!(expired(&segs, &policy, 12 * DAY_NS - 1).is_empty());
+        assert_eq!(expired(&segs, &policy, 12 * DAY_NS - 1), [] as [u64; 0]);
         assert_eq!(expired(&segs, &policy, 12 * DAY_NS), vec![1]);
         assert_eq!(expired(&segs, &policy, 14 * DAY_NS), vec![1, 2, 3]);
         // min_age is a floor.
@@ -142,10 +142,13 @@ mod tests {
             max_age: Some(days(1)),
             min_age: days(3),
         };
-        assert!(expired(&segs, &floored, 13 * DAY_NS).is_empty());
+        assert_eq!(expired(&segs, &floored, 13 * DAY_NS), [] as [u64; 0]);
         assert_eq!(expired(&segs, &floored, 14 * DAY_NS), vec![1]);
         // No max_age keeps everything.
-        assert!(expired(&segs, &RetentionPolicy::default(), i64::MAX).is_empty());
+        assert_eq!(
+            expired(&segs, &RetentionPolicy::default(), i64::MAX),
+            [] as [u64; 0]
+        );
     }
 
     #[test]

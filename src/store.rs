@@ -882,7 +882,7 @@ mod tests {
         s.append(vec![r.clone()]).unwrap();
         s.flush().unwrap();
         assert!(s.fields().is_full());
-        assert!(s.fields().ids("c").is_empty());
+        assert_eq!(s.fields().ids("c"), []);
         drop(s);
         let s = Store::open(dir.path(), opts).unwrap();
         let mut got: Vec<Record> = s
