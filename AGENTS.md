@@ -35,7 +35,7 @@ Non-negotiable design rules (see `docs/decisions.md`):
 
 ## Tech stack
 
-- Rust, **edition 2024** (Rust ≥ 1.85), single crate, no workspace.
+- Rust, **edition 2024**, MSRV **1.89**, single crate, no workspace.
 - **Dependencies**: `zstd`, `memmap2`, `crc32fast`, `roaring` (0.11, no
   default features). When adding one, follow
   uSIEM's rule: named crates with shallow dependency trees only. Candidates already considered in the
@@ -46,16 +46,19 @@ Non-negotiable design rules (see `docs/decisions.md`):
 ## Commands
 
 ```
-cargo build
-cargo test
-cargo test --features failpoints --test crash
-cargo fmt
-cargo clippy --all-features --all-targets
+cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked
+cargo test --locked --all-features   # + crash tests (feature failpoints)
+cargo deny check
 ```
 
-CI (`.github/workflows/ci.yml`) builds and tests on Ubuntu, Windows and
-macOS, plus `cargo fmt --check` and `cargo clippy`. Keep the repo fmt-clean
-and clippy-clean.
+CI (`.github/workflows/ci.yml`) runs these on Ubuntu, Windows and macOS,
+plus MSRV, docs, `cargo package` and semver checks. The crate's `[lints]`
+table is strict (clippy pedantic, `missing_docs`, `unsafe_code = "deny"`);
+keep the repo warning-free. Fuzz targets for the on-disk decoders live in
+`fuzz/` (entry points in `src/fuzz_api.rs`).
 
 ## Repo layout
 
@@ -77,8 +80,10 @@ src/
 ├── retention.rs    # docs/design/08-components.md
 ├── tiering.rs      # docs/design/08-components.md
 ├── integrity.rs    # docs/design/08-components.md
-└── replication.rs  # docs/design/07-replication-channel.md
+├── replication.rs  # docs/design/07-replication-channel.md
+└── fuzz_api.rs     # hidden entry points for the fuzz targets
 tests/crash.rs      # crash recovery (feature failpoints)
+fuzz/               # cargo-fuzz targets (own Cargo.lock, not packaged)
 spikes/             # standalone experiment crates (not built by CI)
 docs/
 ├── README.md       # reading order

@@ -1,5 +1,8 @@
 # usiem-evstore
 
+[![CI](https://github.com/u-siem/evstore/actions/workflows/ci.yml/badge.svg)](https://github.com/u-siem/evstore/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 An embedded, schema-aware, multi-tenant **event store library** for [uSIEM](https://github.com/u-siem/usiem).
 
 > **Status: MVP + M3.** A single-tenant store per directory works: write-ahead log, columnar segments with per-field dictionaries and postings, manifest, retention, compaction, filtered scans and aggregations (`Store`). It serves queries through usiem-query. The multi-tenant architecture in [`docs/`](docs/README.md) is still the target; every MVP cut is listed in [docs/decisions.md](docs/decisions.md). Measured cost: [spike 05](docs/spikes/05-r6-segment-build.md), [spike 06](docs/spikes/06-m3-dictionaries-postings-aggregations.md).
@@ -16,15 +19,17 @@ An embedded, schema-aware, multi-tenant **event store library** for [uSIEM](http
 
 Start with [docs/README.md](docs/README.md). The decisions taken so far are listed in [docs/decisions.md](docs/decisions.md).
 
-## Building
+## Installing
 
+The crate is not on crates.io yet. Depend on it through git, pinned to a
+commit:
+
+```toml
+[dependencies]
+usiem-evstore = { git = "https://github.com/u-siem/evstore", rev = "<commit>" }
 ```
-cargo build
-cargo test
-cargo test --features failpoints --test crash   # crash recovery, real process aborts
-cargo fmt
-cargo clippy --all-features --all-targets
-```
+
+The minimum supported Rust version is 1.89.
 
 ## Using it
 
@@ -42,6 +47,24 @@ let newest = Query {
 for record in store.search(&newest)? { /* ... */ }
 store.maintain(usiem_evstore::now_ns())?; // call every second or so
 ```
+
+## Features
+
+| Feature | Adds |
+|---|---|
+| `failpoints` | Test-only crash injection for `tests/crash.rs`. Never enable it in production builds. |
+
+## Building
+
+```sh
+cargo build
+cargo test
+cargo test --all-features          # adds the crash-recovery tests (real process aborts)
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for everything CI checks, and
+[SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## License
 

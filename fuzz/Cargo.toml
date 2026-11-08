@@ -1,0 +1,51 @@
+[package]
+name = "usiem-evstore-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+usiem-evstore = { path = ".." }
+
+# Not part of the crate's (non-existent) workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "wal_replay"
+path = "fuzz_targets/wal_replay.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segment_footer"
+path = "fuzz_targets/segment_footer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segment_block"
+path = "fuzz_targets/segment_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segment_file"
+path = "fuzz_targets/segment_file.rs"
+test = false
+doc = false
+bench = false
