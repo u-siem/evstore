@@ -65,8 +65,10 @@ use crate::model::{Record, Value, ValueType, cmp_ci};
 
 const MAGIC: &[u8; 4] = b"EVSG";
 const VERSION: u16 = 2;
-const HEADER_LEN: u64 = 8;
+const HEADER_LEN: usize = 8;
 const TAIL_LEN: usize = 20;
+/// Largest possible zstd expansion: a 128 KiB RLE block in 4 bytes.
+const MAX_ZSTD_RATIO: u64 = 1 << 15;
 
 /// Default rows per chunk.
 pub const DEFAULT_CHUNK_ROWS: usize = 4096;
@@ -239,22 +241,22 @@ impl ColData {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct PlainStrings {
     data: String,
-    ends: Vec<u32>,
+    ends: Vec<usize>,
 }
 
 impl PlainStrings {
-    pub fn push(&mut self, s: &str) {
+    pub(crate) fn push(&mut self, s: &str) {
         self.data.push_str(s);
-        self.ends.push(self.data.len() as u32);
+        self.ends.push(self.data.len());
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.ends.len()
     }
 
-    pub fn get(&self, i: usize) -> &str {
-        let start = if i == 0 { 0 } else { self.ends[i - 1] as usize };
-        &self.data[start..self.ends[i] as usize]
+    pub(crate) fn get(&self, i: usize) -> &str {
+        let start = if i == 0 { 0 } else { self.ends[i - 1] };
+        &self.data[start..self.ends[i]]
     }
 }
 
@@ -267,13 +269,13 @@ pub(crate) struct Column {
 }
 
 impl Column {
-    pub fn range(&self, row: usize) -> std::ops::Range<usize> {
+    pub(crate) fn range(&self, row: usize) -> std::ops::Range<usize> {
         self.offsets[row] as usize..self.offsets[row + 1] as usize
     }
 
     /// Materializes value `i`; dictionary codes are looked up in `dict`,
     /// which must be the column's field dictionary.
-    pub fn value(&self, i: usize, dict: Option<&Dict>) -> Value {
+    pub(crate) fn value(&self, i: usize, dict: Option<&Dict>) -> Value {
         match &self.data {
             ColData::Str(v) => Value::Str(
                 dict.expect("dictionary column needs its dictionary")
@@ -301,25 +303,25 @@ pub(crate) struct Dict {
 
 impl Dict {
     /// Sorts and dedups dictionary input (lowercase first, then original).
-    pub fn sort(strings: &mut Vec<String>) {
+    pub(crate) fn sort(strings: &mut Vec<String>) {
         strings.sort_by(|a, b| cmp_ci(a, b).then_with(|| a.cmp(b)));
         strings.dedup();
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.strings.len()
     }
 
-    pub fn get(&self, code: u32) -> &str {
+    pub(crate) fn get(&self, code: u32) -> &str {
         &self.strings[code as usize]
     }
 
     /// Lowercase form of `code`.
-    pub fn lower(&self, code: u32) -> &str {
+    pub(crate) fn lower(&self, code: u32) -> &str {
         &self.lower[code as usize]
     }
 
-    pub fn strings(&self) -> &[String] {
+    pub(crate) fn strings(&self) -> &[String] {
         &self.strings
     }
 }
@@ -387,7 +389,7 @@ impl SegmentWriter {
     /// name, its dictionary or plain encoding; fields not listed are plain.
     /// `postings` asks for postings (written only if the segment ends up
     /// with at least [`POSTINGS_MIN_ROWS`] rows).
-    pub fn create(
+    pub(crate) fn create(
         path: &Path,
         encodings: HashMap<String, StrEncoding>,
         level: i32,
@@ -400,7 +402,7 @@ impl SegmentWriter {
             .open(path)
             .map_err(|e| StoreError::io(path, e))?;
         let mut out = BufWriter::with_capacity(1 << 20, file);
-        let mut header = Vec::with_capacity(HEADER_LEN as usize);
+        let mut header = Vec::with_capacity(HEADER_LEN);
         header.extend_from_slice(MAGIC);
         header.extend_from_slice(&VERSION.to_le_bytes());
         header.extend_from_slice(&0u16.to_le_bytes());
@@ -409,7 +411,7 @@ impl SegmentWriter {
         Ok(SegmentWriter {
             out,
             path: path.to_owned(),
-            pos: HEADER_LEN,
+            pos: HEADER_LEN as u64,
             level,
             chunk_rows: chunk_rows.max(1),
             postings,
@@ -427,7 +429,7 @@ impl SegmentWriter {
     }
 
     /// Adds a record; records must arrive in non-decreasing `ts` order.
-    pub fn push(&mut self, rec: Record) -> Result<()> {
+    pub(crate) fn push(&mut self, rec: Record) -> Result<()> {
         if rec.ts < self.last_ts {
             return Err(StoreError::InvalidArgument(
                 "segment rows must be pushed in time order".into(),
@@ -443,7 +445,7 @@ impl SegmentWriter {
 
     /// Writes time-sorted rows directly, without copying them. Must not be
     /// mixed with buffered rows from [`push`](Self::push).
-    pub fn push_sorted(&mut self, rows: &[&Record]) -> Result<()> {
+    pub(crate) fn push_sorted(&mut self, rows: &[&Record]) -> Result<()> {
         if !self.pending.is_empty() {
             return Err(StoreError::InvalidArgument("push_sorted after push".into()));
         }
@@ -461,13 +463,14 @@ impl SegmentWriter {
         Ok(())
     }
 
-    fn local_field(&mut self, name: &str, ty: ValueType) -> u32 {
+    fn local_field(&mut self, name: &str, ty: ValueType) -> Result<u32> {
         if let Some(ids) = self.field_ids.get(name)
             && let Some((_, id)) = ids.iter().find(|(t, _)| *t == ty)
         {
-            return *id;
+            return Ok(*id);
         }
-        let id = self.fields.len() as u32;
+        let id = u32::try_from(self.fields.len())
+            .map_err(|_| StoreError::InvalidArgument("segment exceeds u32 fields".into()))?;
         self.fields.push((name.to_owned(), ty));
         self.field_ids
             .entry(name.to_owned())
@@ -477,10 +480,15 @@ impl SegmentWriter {
             let codes = match self.encodings.remove(name) {
                 Some(StrEncoding::Dict(mut dict)) => {
                     Dict::sort(&mut dict);
+                    if u32::try_from(dict.len()).is_err() {
+                        return Err(StoreError::InvalidArgument(
+                            "dictionary exceeds u32 entries".into(),
+                        ));
+                    }
                     Some(
-                        dict.into_iter()
-                            .enumerate()
-                            .map(|(i, s)| (s, i as u32))
+                        (0u32..)
+                            .zip(dict)
+                            .map(|(i, s)| (s, i))
                             .collect::<HashMap<_, _>>(),
                     )
                 }
@@ -492,7 +500,7 @@ impl SegmentWriter {
             };
             self.strings.insert(id, StrField { codes, postings });
         }
-        id
+        Ok(id)
     }
 
     fn write_block(&mut self, raw: &[u8]) -> Result<BlockRef> {
@@ -526,23 +534,27 @@ impl SegmentWriter {
         let n = rows.len();
         let ts_min = rows[0].ts;
         let ts_max = rows[n - 1].ts;
-        let first_row = u32::try_from(self.rows)
-            .map_err(|_| StoreError::InvalidArgument("segment exceeds u32 rows".into()))?;
+        // Every row index, up to the chunk's last, must fit a `u32`.
+        let too_many = || StoreError::InvalidArgument("segment exceeds u32 rows".into());
+        let first_row = u32::try_from(self.rows).map_err(|_| too_many())?;
+        let n32 = u32::try_from(n).map_err(|_| too_many())?;
+        first_row.checked_add(n32 - 1).ok_or_else(too_many)?;
 
         let mut ts_raw = Vec::with_capacity(n * 2 + 8);
         ts_raw.extend_from_slice(&ts_min.to_le_bytes());
         let mut prev = ts_min;
         for r in rows {
-            put_uvarint(&mut ts_raw, r.ts.wrapping_sub(prev) as u64);
+            put_uvarint(&mut ts_raw, r.ts.wrapping_sub(prev).cast_unsigned());
             prev = r.ts;
         }
         let ts_block = self.write_block(&ts_raw)?;
 
         let mut builders: Vec<Option<ColBuilder>> = Vec::new();
-        for (row, rec) in rows.iter().enumerate() {
+        for (row, rec) in (0u32..).zip(rows) {
+            let row_idx = row as usize;
             for (name, value) in &rec.fields {
                 let ty = value.value_type();
-                let id = self.local_field(name, ty);
+                let id = self.local_field(name, ty)?;
                 let idx = id as usize;
                 if builders.len() <= idx {
                     builders.resize_with(idx + 1, || None);
@@ -553,7 +565,7 @@ impl SegmentWriter {
                     counts: vec![0; n],
                     data: ColData::new(ty, plain),
                 });
-                b.counts[row] += 1;
+                b.counts[row_idx] += 1;
                 match (&mut b.data, value) {
                     (ColData::Str(v), Value::Str(s)) => {
                         let field = self.strings.get_mut(&id).expect("string field state");
@@ -564,7 +576,7 @@ impl SegmentWriter {
                             ))
                         })?;
                         if let Some(bitmap) = field.postings.get_mut(code as usize) {
-                            bitmap.insert(first_row + row as u32);
+                            bitmap.insert(first_row + row);
                         }
                         v.push(code);
                     }
@@ -590,9 +602,10 @@ impl SegmentWriter {
             encode_values(&mut raw, &b.data);
             let block = self.write_block(&raw)?;
             columns.push(ColumnMeta {
-                field: id as u32,
+                field: u32::try_from(id).expect("field ids are u32"),
                 block,
-                present: b.counts.iter().filter(|c| **c > 0).count() as u32,
+                present: u32::try_from(b.counts.iter().filter(|c| **c > 0).count())
+                    .expect("at most n32 rows"),
                 zone: zone_of(b.ty, &b.data),
             });
         }
@@ -601,7 +614,7 @@ impl SegmentWriter {
         self.ts_min = self.ts_min.min(ts_min);
         self.ts_max = self.ts_max.max(ts_max);
         self.chunks.push(ChunkMeta {
-            rows: n as u32,
+            rows: n32,
             ts_min,
             ts_max,
             ts_block,
@@ -617,7 +630,7 @@ impl SegmentWriter {
 
     /// Writes the remaining rows, dictionaries, postings and footer, then
     /// fsyncs.
-    pub fn finish(mut self) -> Result<SegmentSummary> {
+    pub(crate) fn finish(mut self) -> Result<SegmentSummary> {
         self.write_chunk()?;
         let with_postings = self.postings && self.rows >= POSTINGS_MIN_ROWS;
         let mut storage = vec![FieldStorage::default(); self.fields.len()];
@@ -642,7 +655,7 @@ impl SegmentWriter {
             storage[id as usize] = FieldStorage {
                 dict: Some(DictRef {
                     block,
-                    len: dict.len() as u32,
+                    len: u32::try_from(dict.len()).expect("checked in local_field"),
                     slot: id as usize,
                 }),
                 postings,
@@ -690,7 +703,9 @@ impl SegmentWriter {
         let footer_off = self.pos;
         let mut tail = Vec::with_capacity(TAIL_LEN);
         tail.extend_from_slice(&footer_off.to_le_bytes());
-        tail.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+        let footer_len = u32::try_from(footer.len())
+            .map_err(|_| StoreError::InvalidArgument("segment footer exceeds 4 GiB".into()))?;
+        tail.extend_from_slice(&footer_len.to_le_bytes());
         tail.extend_from_slice(&crc32(&footer).to_le_bytes());
         tail.extend_from_slice(MAGIC);
         self.out
@@ -739,27 +754,32 @@ fn decode_values(
     n: usize,
     dict_len: Option<usize>,
 ) -> DResult<ColData> {
+    // Every value takes at least one byte, so `n` cannot exceed the input;
+    // checking first keeps a corrupt count from driving the allocations.
+    if n > r.remaining() {
+        return Err(DecodeError("value count exceeds data"));
+    }
     Ok(match ty {
-        ValueType::Str => match dict_len {
-            Some(len) => {
+        ValueType::Str => {
+            if let Some(len) = dict_len {
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     let c = r.uvarint()?;
-                    if c >= len as u64 {
-                        return Err(DecodeError("dictionary code out of range"));
-                    }
-                    v.push(c as u32);
+                    let c = u32::try_from(c)
+                        .ok()
+                        .filter(|c| (*c as usize) < len)
+                        .ok_or(DecodeError("dictionary code out of range"))?;
+                    v.push(c);
                 }
                 ColData::Str(v)
-            }
-            None => {
+            } else {
                 let mut v = PlainStrings::default();
                 for _ in 0..n {
                     v.push(r.str()?);
                 }
                 ColData::Plain(v)
             }
-        },
+        }
         ValueType::I64 | ValueType::Time => {
             ColData::Int((0..n).map(|_| r.ivarint()).collect::<DResult<_>>()?)
         }
@@ -815,10 +835,27 @@ fn zone_of(ty: ValueType, data: &ColData) -> ZoneMap {
     zone.unwrap_or(ZoneMap::None)
 }
 
+/// The bytes of a segment: a file mapping, or a buffer (fuzzing).
+pub(crate) enum SegmentBytes {
+    Mapped(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for SegmentBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            SegmentBytes::Mapped(m) => m,
+            SegmentBytes::Owned(v) => v,
+        }
+    }
+}
+
 /// An open, memory-mapped segment.
 pub(crate) struct Segment {
     path: PathBuf,
-    map: Mmap,
+    map: SegmentBytes,
     pub rows: u64,
     pub ts_min: i64,
     pub ts_max: i64,
@@ -835,11 +872,11 @@ impl std::fmt::Debug for Segment {
             .field("path", &self.path)
             .field("rows", &self.rows)
             .field("chunks", &self.chunks.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
-struct Footer {
+pub(crate) struct Footer {
     rows: u64,
     ts_min: i64,
     ts_max: i64,
@@ -851,15 +888,22 @@ struct Footer {
 
 impl Segment {
     /// Maps `path` and validates its header, tail and footer.
-    pub fn open(path: &Path) -> Result<Segment> {
+    pub(crate) fn open(path: &Path) -> Result<Segment> {
         let file = File::open(path).map_err(|e| StoreError::io(path, e))?;
         // SAFETY: segment files are immutable once written and the store never
         // truncates or rewrites a published segment; deletion happens only
         // after the last reader drops its `Arc<Segment>`.
+        #[allow(unsafe_code)]
         let map = unsafe { Mmap::map(&file) }.map_err(|e| StoreError::io(path, e))?;
+        Segment::from_bytes(path, SegmentBytes::Mapped(map))
+    }
+
+    /// Validates the header, tail and footer of segment bytes; `path` only
+    /// names the file in errors.
+    pub(crate) fn from_bytes(path: &Path, map: SegmentBytes) -> Result<Segment> {
         let corrupt = |off: u64, why: &str| StoreError::corrupt(path, off, why);
         let len = map.len();
-        if len < HEADER_LEN as usize + TAIL_LEN || &map[..4] != MAGIC {
+        if len < HEADER_LEN + TAIL_LEN || &map[..4] != MAGIC {
             return Err(corrupt(0, "bad segment header"));
         }
         let version = u16::from_le_bytes([map[4], map[5]]);
@@ -874,7 +918,7 @@ impl Segment {
             return Err(corrupt((len - 4) as u64, "bad segment tail magic"));
         }
         let footer_off = u64::from_le_bytes(tail[..8].try_into().expect("8 bytes"));
-        let footer_len = u32::from_le_bytes(tail[8..12].try_into().expect("4 bytes")) as u64;
+        let footer_len = u64::from(u32::from_le_bytes(tail[8..12].try_into().expect("4 bytes")));
         let footer_crc = u32::from_le_bytes(tail[12..16].try_into().expect("4 bytes"));
         if footer_off.checked_add(footer_len) != Some((len - TAIL_LEN) as u64) {
             return Err(corrupt(
@@ -882,7 +926,10 @@ impl Segment {
                 "footer bounds do not match file size",
             ));
         }
-        let footer = &map[footer_off as usize..len - TAIL_LEN];
+        let footer = usize::try_from(footer_off)
+            .ok()
+            .and_then(|off| map.get(off..len - TAIL_LEN))
+            .ok_or_else(|| corrupt(footer_off, "footer out of bounds"))?;
         if crc32(footer) != footer_crc {
             return Err(corrupt(footer_off, "footer checksum mismatch"));
         }
@@ -905,16 +952,32 @@ impl Segment {
         })
     }
 
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Size of the segment file in bytes.
+    pub(crate) fn file_len(&self) -> u64 {
+        self.map.len() as u64
+    }
+
     fn block(&self, b: &BlockRef) -> Result<Vec<u8>> {
-        let start = b.off as usize;
-        let bytes = start
-            .checked_add(b.len as usize)
-            .and_then(|end| self.map.get(start..end))
+        let bytes = usize::try_from(b.off)
+            .ok()
+            .and_then(|start| Some((start, start.checked_add(b.len as usize)?)))
+            .and_then(|(start, end)| self.map.get(start..end))
             .ok_or_else(|| StoreError::corrupt(&self.path, b.off, "block out of bounds"))?;
+        // `zstd::bulk::decompress` allocates `raw_len` up front. A zstd block
+        // holds at most 128 KiB and takes at least 4 bytes, so no frame
+        // expands more than `MAX_ZSTD_RATIO` times; a larger `raw_len` is
+        // corrupt and must not drive the allocation.
+        if u64::from(b.raw_len) > u64::from(b.len) * MAX_ZSTD_RATIO {
+            return Err(StoreError::corrupt(
+                &self.path,
+                b.off,
+                "block raw length exceeds what its bytes can hold",
+            ));
+        }
         if crc32(bytes) != b.crc {
             return Err(StoreError::corrupt(
                 &self.path,
@@ -936,7 +999,7 @@ impl Segment {
 
     /// The dictionary of string field `field`, decoded on first use; `None`
     /// for plain and non-string fields.
-    pub fn field_dict(&self, field: u32) -> Result<Option<&Dict>> {
+    pub(crate) fn field_dict(&self, field: u32) -> Result<Option<&Dict>> {
         let Some(dict) = self.storage[field as usize].dict else {
             return Ok(None);
         };
@@ -944,13 +1007,8 @@ impl Segment {
             return Ok(Some(d));
         }
         let raw = self.block(&dict.block)?;
-        let mut r = Reader::new(&raw);
-        let parse = |r: &mut Reader<'_>| -> DResult<Vec<String>> {
-            let n = r.len(1)?;
-            (0..n).map(|_| r.str().map(str::to_owned)).collect()
-        };
         let strings =
-            parse(&mut r).map_err(|e| StoreError::corrupt(&self.path, dict.block.off, e.0))?;
+            decode_dict(&raw).map_err(|e| StoreError::corrupt(&self.path, dict.block.off, e.0))?;
         if strings.len() != dict.len as usize {
             return Err(StoreError::corrupt(
                 &self.path,
@@ -966,7 +1024,7 @@ impl Segment {
 
     /// Row bitmaps per dictionary code of `field`, if the segment has
     /// postings for it.
-    pub fn field_postings(&self, field: u32) -> Result<Option<&[RoaringBitmap]>> {
+    pub(crate) fn field_postings(&self, field: u32) -> Result<Option<&[RoaringBitmap]>> {
         let st = &self.storage[field as usize];
         let (Some(block), Some(dict)) = (st.postings, st.dict) else {
             return Ok(None);
@@ -981,24 +1039,15 @@ impl Segment {
     }
 
     /// Decodes the timestamps of chunk `c`.
-    pub fn timestamps(&self, c: usize) -> Result<Vec<i64>> {
+    pub(crate) fn timestamps(&self, c: usize) -> Result<Vec<i64>> {
         let chunk = &self.chunks[c];
         let raw = self.block(&chunk.ts_block)?;
-        let mut r = Reader::new(&raw);
-        let parse = |r: &mut Reader<'_>| -> DResult<Vec<i64>> {
-            let mut ts = r.i64()?;
-            let mut out = Vec::with_capacity(chunk.rows as usize);
-            for _ in 0..chunk.rows {
-                ts = ts.wrapping_add(r.uvarint()? as i64);
-                out.push(ts);
-            }
-            Ok(out)
-        };
-        parse(&mut r).map_err(|e| StoreError::corrupt(&self.path, chunk.ts_block.off, e.0))
+        decode_timestamps(&raw, chunk.rows)
+            .map_err(|e| StoreError::corrupt(&self.path, chunk.ts_block.off, e.0))
     }
 
     /// Decodes column `col` (index into the chunk's column list) of chunk `c`.
-    pub fn column(&self, c: usize, col: usize) -> Result<Column> {
+    pub(crate) fn column(&self, c: usize, col: usize) -> Result<Column> {
         let chunk = &self.chunks[c];
         let meta = &chunk.columns[col];
         let ty = self.fields[meta.field as usize].1;
@@ -1006,38 +1055,23 @@ impl Segment {
             .dict
             .map(|d| d.len as usize);
         let raw = self.block(&meta.block)?;
-        let mut r = Reader::new(&raw);
-        let mut parse = || -> DResult<Column> {
-            let mut offsets = Vec::with_capacity(chunk.rows as usize + 1);
-            let mut total = 0u32;
-            offsets.push(0);
-            for _ in 0..chunk.rows {
-                let n = u32::try_from(r.uvarint()?).map_err(|_| DecodeError("count overflow"))?;
-                total = total.checked_add(n).ok_or(DecodeError("count overflow"))?;
-                offsets.push(total);
-            }
-            let data = decode_values(&mut r, ty, total as usize, dict_len)?;
-            if !r.is_empty() {
-                return Err(DecodeError("trailing bytes in column"));
-            }
-            Ok(Column { ty, offsets, data })
-        };
-        parse().map_err(|e| StoreError::corrupt(&self.path, meta.block.off, e.0))
+        decode_column(&raw, chunk.rows, ty, dict_len)
+            .map_err(|e| StoreError::corrupt(&self.path, meta.block.off, e.0))
     }
 
     /// Indexes into `fields` whose name is `name`.
-    pub fn field_indexes(&self, name: &str) -> Vec<u32> {
+    pub(crate) fn field_indexes(&self, name: &str) -> Vec<u32> {
         self.fields
             .iter()
             .enumerate()
             .filter(|(_, (n, _))| n == name)
-            .map(|(i, _)| i as u32)
+            .map(|(i, _)| u32::try_from(i).expect("parse_footer caps fields at u32"))
             .collect()
     }
 
     /// How string field `name` is stored here: its dictionary strings, or
     /// `None` when it is plain or absent (for compaction).
-    pub fn string_encoding(&self, name: &str) -> Result<Option<StrEncoding>> {
+    pub(crate) fn string_encoding(&self, name: &str) -> Result<Option<StrEncoding>> {
         let Some(field) = self
             .field_indexes(name)
             .into_iter()
@@ -1052,7 +1086,58 @@ impl Segment {
     }
 }
 
-fn parse_footer(footer: &[u8], version: u16) -> DResult<Footer> {
+/// Decodes a dictionary block (decompressed).
+pub(crate) fn decode_dict(raw: &[u8]) -> DResult<Vec<String>> {
+    let mut r = Reader::new(raw);
+    let n = r.len(1)?;
+    (0..n).map(|_| r.str().map(str::to_owned)).collect()
+}
+
+/// Decodes a timestamp block (decompressed) of a chunk of `rows` rows.
+pub(crate) fn decode_timestamps(raw: &[u8], rows: u32) -> DResult<Vec<i64>> {
+    let mut r = Reader::new(raw);
+    let mut ts = r.i64()?;
+    // One byte at least per row: bound the allocation by the block.
+    if rows as usize > r.remaining() {
+        return Err(DecodeError("row count exceeds timestamp block"));
+    }
+    let mut out = Vec::with_capacity(rows as usize);
+    for _ in 0..rows {
+        ts = ts.wrapping_add(r.uvarint()?.cast_signed());
+        out.push(ts);
+    }
+    Ok(out)
+}
+
+/// Decodes a column block (decompressed) of a chunk of `rows` rows;
+/// `dict_len` is `Some` for dictionary strings.
+pub(crate) fn decode_column(
+    raw: &[u8],
+    rows: u32,
+    ty: ValueType,
+    dict_len: Option<usize>,
+) -> DResult<Column> {
+    let mut r = Reader::new(raw);
+    // One count byte at least per row: bound the allocation.
+    if rows as usize > r.remaining() {
+        return Err(DecodeError("row count exceeds column block"));
+    }
+    let mut offsets = Vec::with_capacity(rows as usize + 1);
+    let mut total = 0u32;
+    offsets.push(0);
+    for _ in 0..rows {
+        let n = u32::try_from(r.uvarint()?).map_err(|_| DecodeError("count overflow"))?;
+        total = total.checked_add(n).ok_or(DecodeError("count overflow"))?;
+        offsets.push(total);
+    }
+    let data = decode_values(&mut r, ty, total as usize, dict_len)?;
+    if !r.is_empty() {
+        return Err(DecodeError("trailing bytes in column"));
+    }
+    Ok(Column { ty, offsets, data })
+}
+
+pub(crate) fn parse_footer(footer: &[u8], version: u16) -> DResult<Footer> {
     let mut r = Reader::new(footer);
     let rows = r.u64()?;
     let ts_min = r.i64()?;
@@ -1063,6 +1148,9 @@ fn parse_footer(footer: &[u8], version: u16) -> DResult<Footer> {
         None
     };
     let nfields = r.len(2)?;
+    if u32::try_from(nfields).is_err() {
+        return Err(DecodeError("too many fields"));
+    }
     let mut fields = Vec::with_capacity(nfields);
     let mut storage = Vec::with_capacity(nfields);
     for i in 0..nfields {
@@ -1111,6 +1199,14 @@ fn parse_footer(footer: &[u8], version: u16) -> DResult<Footer> {
     let mut first_row = 0u64;
     for _ in 0..nchunks {
         let rows = r.u32()?;
+        // Every row index of the segment must fit a `u32` (postings and
+        // chunk lookups rely on it), and a chunk is never empty.
+        if rows == 0 {
+            return Err(DecodeError("empty chunk"));
+        }
+        if first_row + u64::from(rows) > u64::from(u32::MAX) + 1 {
+            return Err(DecodeError("too many rows"));
+        }
         let ts_min = r.i64()?;
         let ts_max = r.i64()?;
         let ts_block = BlockRef::decode(&mut r)?;
@@ -1125,6 +1221,7 @@ fn parse_footer(footer: &[u8], version: u16) -> DResult<Footer> {
             let block = BlockRef::decode(&mut r)?;
             let present = r.u32()?;
             let zone = ZoneMap::decode(&mut r)?;
+            check_zone(&zone, fields[field as usize].1, &storage[field as usize])?;
             columns.push(ColumnMeta {
                 field,
                 block,
@@ -1154,6 +1251,21 @@ fn parse_footer(footer: &[u8], version: u16) -> DResult<Footer> {
         chunks,
         slots,
     })
+}
+
+/// Rejects a zone map that does not fit its column: dictionary codes past
+/// the field's dictionary (they index match tables) or values of another
+/// type.
+fn check_zone(zone: &ZoneMap, ty: ValueType, storage: &FieldStorage) -> DResult<()> {
+    match zone {
+        ZoneMap::None => Ok(()),
+        ZoneMap::Codes(lo, hi) => match storage.dict {
+            Some(d) if lo <= hi && *hi < d.len => Ok(()),
+            _ => Err(DecodeError("zone map codes out of range")),
+        },
+        ZoneMap::Values(lo, hi) if lo.value_type() == ty && hi.value_type() == ty => Ok(()),
+        ZoneMap::Values(..) => Err(DecodeError("zone map type does not match its field")),
+    }
 }
 
 /// Chooses each string field's encoding from the rows that will be written.
@@ -1286,7 +1398,13 @@ mod tests {
         assert_eq!(col.present, 1000);
         // Postings: every host row is in exactly one code's bitmap.
         let postings = seg.field_postings(host).unwrap().unwrap();
-        assert_eq!(postings.iter().map(|b| b.len()).sum::<u64>(), 12_000);
+        assert_eq!(
+            postings
+                .iter()
+                .map(roaring::RoaringBitmap::len)
+                .sum::<u64>(),
+            12_000
+        );
         assert!(seg.field_postings(msg).unwrap().is_none());
     }
 
@@ -1409,7 +1527,7 @@ mod tests {
         let good = std::fs::read(&path).unwrap();
         // Flip a byte in the first data block: open succeeds, the read fails.
         let mut bad = good.clone();
-        bad[HEADER_LEN as usize + 2] ^= 1;
+        bad[HEADER_LEN + 2] ^= 1;
         std::fs::write(&path, &bad).unwrap();
         let seg = Segment::open(&path).unwrap();
         assert!(matches!(seg.timestamps(0), Err(StoreError::Corrupt { .. })));
@@ -1446,5 +1564,138 @@ mod tests {
         assert!(!choose_plain(10, 10), "tiny fields keep a dictionary");
         assert!(choose_plain(600, 1000));
         assert!(!choose_plain(400, 1000));
+    }
+
+    /// A one-chunk segment with a dictionary string field.
+    fn one_chunk(dir: &TempDir, id: u64) -> PathBuf {
+        let path = dir.path().join(segment_file_name(id));
+        let rows: Vec<Record> = (0..50)
+            .map(|i| Record::new(i).with("s", Value::Str(format!("s{}", i % 5))))
+            .collect();
+        write_segment(&path, &rows.iter().collect::<Vec<_>>(), 3, 1000).unwrap();
+        path
+    }
+
+    /// Replaces the single occurrence of `find` in the footer by `replace`
+    /// (same length) and fixes the footer checksum, as a corrupt but
+    /// self-consistent file would have it.
+    fn patch_footer(path: &Path, patches: &[(&[u8], &[u8])]) {
+        let mut data = std::fs::read(path).unwrap();
+        let n = data.len();
+        let tail = n - TAIL_LEN;
+        let off =
+            usize::try_from(u64::from_le_bytes(data[tail..tail + 8].try_into().unwrap())).unwrap();
+        for (find, replace) in patches {
+            assert_eq!(find.len(), replace.len());
+            let footer = &data[off..tail];
+            let at = (0..=footer.len() - find.len())
+                .filter(|i| &footer[*i..*i + find.len()] == *find)
+                .collect::<Vec<_>>();
+            assert_eq!(at.len(), 1, "pattern must be unique in the footer");
+            data[off + at[0]..off + at[0] + find.len()].copy_from_slice(replace);
+        }
+        let crc = crc32(&data[off..tail]);
+        data[tail + 12..tail + 16].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(path, &data).unwrap();
+    }
+
+    fn block_bytes(b: &BlockRef) -> Vec<u8> {
+        let mut out = Vec::new();
+        b.encode(&mut out);
+        out
+    }
+
+    #[test]
+    fn huge_raw_len_is_corrupt_not_an_allocation() {
+        let dir = TempDir::new("seg-rawlen");
+        let path = one_chunk(&dir, 1);
+        let ts_block = Segment::open(&path).unwrap().chunks[0].ts_block;
+        let huge = BlockRef {
+            raw_len: u32::MAX,
+            ..ts_block
+        };
+        patch_footer(&path, &[(&block_bytes(&ts_block), &block_bytes(&huge))]);
+        let seg = Segment::open(&path).unwrap();
+        assert!(matches!(seg.timestamps(0), Err(StoreError::Corrupt { .. })));
+    }
+
+    #[test]
+    fn huge_chunk_row_count_is_corrupt() {
+        let dir = TempDir::new("seg-rows");
+        let path = one_chunk(&dir, 1);
+        let seg = Segment::open(&path).unwrap();
+        let c = &seg.chunks[0];
+        let mut old = c.rows.to_le_bytes().to_vec();
+        old.extend_from_slice(&c.ts_min.to_le_bytes());
+        old.extend_from_slice(&c.ts_max.to_le_bytes());
+        let mut new = old.clone();
+        new[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut head = seg.rows.to_le_bytes().to_vec();
+        head.extend_from_slice(&seg.ts_min.to_le_bytes());
+        head.extend_from_slice(&seg.ts_max.to_le_bytes());
+        let mut new_head = head.clone();
+        new_head[..8].copy_from_slice(&u64::from(u32::MAX).to_le_bytes());
+        drop(seg);
+        patch_footer(&path, &[(&old, &new), (&head, &new_head)]);
+        // Before: a 32 GiB `Vec::with_capacity` per decoded chunk.
+        let seg = Segment::open(&path).unwrap();
+        assert!(matches!(seg.timestamps(0), Err(StoreError::Corrupt { .. })));
+        assert!(matches!(seg.column(0, 0), Err(StoreError::Corrupt { .. })));
+    }
+
+    #[test]
+    fn empty_chunk_is_corrupt() {
+        let dir = TempDir::new("seg-empty-chunk");
+        let path = one_chunk(&dir, 1);
+        let seg = Segment::open(&path).unwrap();
+        let c = &seg.chunks[0];
+        let mut old = c.rows.to_le_bytes().to_vec();
+        old.extend_from_slice(&c.ts_min.to_le_bytes());
+        old.extend_from_slice(&c.ts_max.to_le_bytes());
+        let mut new = old.clone();
+        new[..4].copy_from_slice(&0u32.to_le_bytes());
+        let mut head = seg.rows.to_le_bytes().to_vec();
+        head.extend_from_slice(&seg.ts_min.to_le_bytes());
+        head.extend_from_slice(&seg.ts_max.to_le_bytes());
+        let mut new_head = head.clone();
+        new_head[..8].copy_from_slice(&0u64.to_le_bytes());
+        drop(seg);
+        patch_footer(&path, &[(&old, &new), (&head, &new_head)]);
+        assert!(matches!(
+            Segment::open(&path),
+            Err(StoreError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn zone_codes_past_the_dictionary_are_corrupt() {
+        let dir = TempDir::new("seg-zone");
+        let path = one_chunk(&dir, 1);
+        let seg = Segment::open(&path).unwrap();
+        let col = &seg.chunks[0].columns[0];
+        let ZoneMap::Codes(lo, hi) = col.zone else {
+            panic!("dictionary column has a code zone map");
+        };
+        let mut old = block_bytes(&col.block);
+        old.extend_from_slice(&col.present.to_le_bytes());
+        let mut new = old.clone();
+        ZoneMap::Codes(lo, hi).encode(&mut old);
+        // A query used the codes to index its per-code match table.
+        ZoneMap::Codes(lo, 1_000_000).encode(&mut new);
+        drop(seg);
+        patch_footer(&path, &[(&old, &new)]);
+        assert!(matches!(
+            Segment::open(&path),
+            Err(StoreError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn value_count_is_bounded_by_the_input() {
+        // Before: `Vec::with_capacity(u32::MAX)` of dictionary codes.
+        let r = &mut Reader::new(&[0, 0, 0]);
+        assert!(decode_values(r, ValueType::Str, u32::MAX as usize, Some(10)).is_err());
+        let r = &mut Reader::new(&[1, 2]);
+        assert!(decode_values(r, ValueType::Str, 2, Some(2)).is_err());
     }
 }

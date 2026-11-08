@@ -1,18 +1,68 @@
 //! # usiem-evstore
 //!
-//! Embedded, schema-aware, multi-tenant event store **library** for uSIEM.
+//! An embedded, schema-aware event store **library** for uSIEM: it is
+//! linked into the application, like SQLite, and owns the files of one
+//! directory. It starts no threads; the application calls
+//! [`Store::maintain`] periodically.
 //!
-//! **Status: MVP + M3.** A single-tenant store per directory is
-//! implemented: a write-ahead log, sealed columnar segments (per-field
-//! dictionaries, postings), a generation-numbered manifest, retention,
-//! compaction, a scan query with pruning and aggregations (see [`Store`]).
-//! The rest of the design (catalog, tiering, integrity, replication, the
-//! multi-tenant directory) lives in `docs/`
-//! (start at `docs/README.md`); the modules that implement nothing yet keep
-//! only their design notes. Every MVP cut is recorded in
-//! `docs/decisions.md`.
+//! - **Durable ingest.** [`Store::append`] writes a batch to a
+//!   checksummed write-ahead log as one atomic frame ([`SyncPolicy`] decides
+//!   when it is fsynced). Records are searchable at once.
+//! - **Compact columnar segments.** Flushes turn the WAL into immutable,
+//!   memory-mapped segment files: time-sorted chunks, zstd-compressed
+//!   columns, per-field string dictionaries, zone maps and, for large
+//!   segments, Roaring postings.
+//! - **Search and aggregations.** [`Store::search`] runs a [`Query`] (time
+//!   range, [`Filter`], [`Order`], limit) with segment, chunk and index
+//!   pruning; [`Store::aggregate`] groups and counts, sums, or finds minimums
+//!   and maximums ([`AggQuery`]).
+//! - **Crash safety.** A generation-numbered manifest is the commit point;
+//!   open recovers from torn WAL tails, torn manifests and interrupted
+//!   flushes or compactions ([`Recovery`]).
+//! - **Retention and compaction** by ingest day ([`RetentionPolicy`]).
 //!
-//! # Architecture
+//! **Status: MVP + M3.** One store directory holds one tenant. The
+//! multi-tenant design (catalog, tiering, integrity, replication, the
+//! tenant directory) lives in
+//! [`docs/`](https://github.com/u-siem/evstore/tree/main/docs); the modules
+//! that implement nothing yet keep only their design notes.
+//!
+//! ## Features
+//!
+//! | Feature | Adds |
+//! |---|---|
+//! | `failpoints` | Test-only crash injection (`EVSTORE_CRASH_AT=<name>` aborts the process at that point). Never enable it in production builds. |
+//!
+//! ## Example
+//!
+//! ```
+//! use usiem_evstore::{FieldOp, Filter, Options, Order, Query, Record, Store, Value};
+//!
+//! # let dir = std::env::temp_dir().join(format!("evstore-doc-{}", std::process::id()));
+//! let mut store = Store::open(&dir, Options::default())?;
+//! store.append(vec![
+//!     Record::new(1_700_000_000_000_000_000).with("host", Value::Str("nas".into())),
+//!     Record::new(1_700_000_001_000_000_000).with("host", Value::Str("web01".into())),
+//! ])?;
+//! store.flush()?;
+//!
+//! // Strings compare case-insensitively.
+//! let newest = Query {
+//!     filter: Filter::field("host", FieldOp::Eq(Value::Str("NAS".into()))),
+//!     order: Order::Desc,
+//!     limit: Some(100),
+//!     ..Query::default()
+//! };
+//! let hits: Vec<Record> = store.search(&newest)?.collect::<Result<_, _>>()?;
+//! assert_eq!(hits.len(), 1);
+//!
+//! store.maintain(usiem_evstore::now_ns())?; // call every second or so
+//! # drop(store);
+//! # std::fs::remove_dir_all(&dir)?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! ## Architecture
 //!
 //! - **A library, not a database server** ("distributed SQLite"): one
 //!   instance owns its tenants and files. No cluster membership, consensus,
@@ -42,11 +92,27 @@
 //! | [`registry`] | Dynamic field registry (typed identities, cap, overflow) |
 //! | [`aggregate`] | Grouped counts, sums, min/max over one store |
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
+// Numbers of different types compare, and sums accumulate, as `f64` by
+// design; the precision loss past 2^53 is documented behaviour.
+#![allow(clippy::cast_precision_loss)]
+// Test data generators narrow random `u64`s on purpose.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss
+    )
+)]
+
 pub mod aggregate;
 pub mod catalog;
 mod codec;
 pub mod directory;
 mod error;
+#[doc(hidden)]
+pub mod fuzz_api;
 pub mod index;
 pub mod integrity;
 mod model;

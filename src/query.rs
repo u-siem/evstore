@@ -304,7 +304,7 @@ impl CompiledOp {
             FieldOp::Exists => true,
             FieldOp::Eq(lit) => compare(v, lit) == Some(Ordering::Equal),
             FieldOp::In(lits) => lits.iter().any(|l| compare(v, l) == Some(Ordering::Equal)),
-            FieldOp::Range { lower, upper } => range_ok(v, lower, upper),
+            FieldOp::Range { lower, upper } => range_ok(v, lower.as_ref(), upper.as_ref()),
             FieldOp::Cidr { lo, hi } => matches!(v, Value::Ip(ip) if ip >= lo && ip <= hi),
             FieldOp::HasType(t) => v.value_type() == *t,
             FieldOp::Prefix(_) | FieldOp::Contains(_) | FieldOp::Glob(_) => false,
@@ -362,7 +362,7 @@ fn bound_ok(ord: Ordering, lower: bool, inclusive: bool) -> bool {
     }
 }
 
-fn range_ok(v: &Value, lower: &Option<(Value, bool)>, upper: &Option<(Value, bool)>) -> bool {
+fn range_ok(v: &Value, lower: Option<&(Value, bool)>, upper: Option<&(Value, bool)>) -> bool {
     let lo = match lower {
         None => true,
         Some((b, inc)) => compare(v, b).is_some_and(|o| bound_ok(o, true, *inc)),
@@ -476,7 +476,7 @@ pub(crate) fn compile(filter: &Filter, seg: &Segment) -> Result<Plan> {
                     .iter()
                     .enumerate()
                     .filter(|(_, (n, t))| *t == ValueType::Str && n != OVERFLOW_FIELD)
-                    .map(|(i, _)| i as u32)
+                    .map(|(i, _)| u32::try_from(i).expect("parse_footer caps fields at u32"))
                     .collect()
             } else {
                 seg.field_indexes(field)
@@ -491,7 +491,8 @@ pub(crate) fn compile(filter: &Filter, seg: &Segment) -> Result<Plan> {
                 let Some(dict) = seg.field_dict(*f)? else {
                     continue;
                 };
-                let hits: Vec<bool> = (0..dict.len() as u32)
+                let hits: Vec<bool> = (0..u32::try_from(dict.len())
+                    .expect("dictionary sizes are u32"))
                     .map(|c| op.matches_lower(dict.lower(c)))
                     .collect();
                 let mut sums = Vec::with_capacity(hits.len() + 1);
@@ -615,7 +616,7 @@ pub(crate) struct ChunkData {
 }
 
 impl ChunkData {
-    pub fn new() -> ChunkData {
+    pub(crate) fn new() -> ChunkData {
         ChunkData {
             columns: HashMap::new(),
             overflow: None,
@@ -624,7 +625,12 @@ impl ChunkData {
 
     /// Decodes the chunk's columns in `wanted` (all when `None`) that are
     /// not loaded yet.
-    pub fn load(&mut self, seg: &Segment, chunk: usize, wanted: Option<&[u32]>) -> Result<()> {
+    pub(crate) fn load(
+        &mut self,
+        seg: &Segment,
+        chunk: usize,
+        wanted: Option<&[u32]>,
+    ) -> Result<()> {
         for (i, col) in seg.chunks[chunk].columns.iter().enumerate() {
             if wanted.is_some_and(|w| !w.contains(&col.field)) {
                 continue;
@@ -747,7 +753,7 @@ pub(crate) struct SegmentScan {
 
 impl SegmentScan {
     /// Returns `None` when the segment cannot match at all.
-    pub fn new(
+    pub(crate) fn new(
         seg: Arc<Segment>,
         filter: &Filter,
         time: TimeRange,
@@ -792,7 +798,7 @@ impl SegmentScan {
 
     /// First timestamp this scan can produce (its next chunk's minimum
     /// ascending, maximum descending); `None` when no chunk survived pruning.
-    pub fn bound(&self) -> Option<i64> {
+    pub(crate) fn bound(&self) -> Option<i64> {
         let c = &self.seg.chunks[*self.chunks.last()?];
         Some(if self.desc { c.ts_max } else { c.ts_min })
     }
@@ -1209,12 +1215,12 @@ pub(crate) mod tests {
         }
         match rng.below(3) {
             0 => Filter::And(
-                (0..1 + rng.below(3))
+                (0..=rng.below(3))
                     .map(|_| random_filter(rng, depth - 1))
                     .collect(),
             ),
             1 => Filter::Or(
-                (0..1 + rng.below(3))
+                (0..=rng.below(3))
                     .map(|_| random_filter(rng, depth - 1))
                     .collect(),
             ),

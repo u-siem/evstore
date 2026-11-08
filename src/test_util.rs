@@ -9,7 +9,7 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 pub(crate) struct TempDir(PathBuf);
 
 impl TempDir {
-    pub fn new(tag: &str) -> TempDir {
+    pub(crate) fn new(tag: &str) -> TempDir {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("evstore-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
@@ -17,7 +17,7 @@ impl TempDir {
         TempDir(path)
     }
 
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.0
     }
 }
@@ -32,11 +32,11 @@ impl Drop for TempDir {
 pub(crate) struct Rng(u64);
 
 impl Rng {
-    pub fn new(seed: u64) -> Rng {
+    pub(crate) fn new(seed: u64) -> Rng {
         Rng(seed.max(1))
     }
 
-    pub fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -46,15 +46,15 @@ impl Rng {
     }
 
     /// Uniform in `0..n` (n > 0).
-    pub fn below(&mut self, n: u64) -> u64 {
+    pub(crate) fn below(&mut self, n: u64) -> u64 {
         self.next() % n
     }
 
-    pub fn chance(&mut self, percent: u64) -> bool {
+    pub(crate) fn chance(&mut self, percent: u64) -> bool {
         self.below(100) < percent
     }
 
-    pub fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+    pub(crate) fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
         &items[self.below(items.len() as u64) as usize]
     }
 }

@@ -43,7 +43,7 @@ use crate::model::Record;
 
 const MAGIC: &[u8; 4] = b"EVWL";
 const VERSION: u16 = 1;
-const HEADER_LEN: u64 = 16;
+const HEADER_LEN: usize = 16;
 /// Upper bound for one frame; anything larger is treated as corruption.
 const MAX_FRAME: u32 = 256 << 20;
 
@@ -96,7 +96,7 @@ pub(crate) struct Wal {
 
 impl Wal {
     /// Creates a new, empty WAL (fails if it exists) and syncs its header.
-    pub fn create(dir: &Path, generation: u64) -> Result<Wal> {
+    pub(crate) fn create(dir: &Path, generation: u64) -> Result<Wal> {
         let path = dir.join(wal_file_name(generation));
         let mut file = OpenOptions::new()
             .read(true)
@@ -104,7 +104,7 @@ impl Wal {
             .create_new(true)
             .open(&path)
             .map_err(|e| StoreError::io(&path, e))?;
-        let mut header = Vec::with_capacity(HEADER_LEN as usize);
+        let mut header = Vec::with_capacity(HEADER_LEN);
         header.extend_from_slice(MAGIC);
         header.extend_from_slice(&VERSION.to_le_bytes());
         header.extend_from_slice(&0u16.to_le_bytes());
@@ -116,7 +116,7 @@ impl Wal {
             file,
             path,
             generation,
-            len: HEADER_LEN,
+            len: HEADER_LEN as u64,
             last_sync: Instant::now(),
             unsynced: false,
             created: Instant::now(),
@@ -124,7 +124,7 @@ impl Wal {
     }
 
     /// Opens an existing WAL, replays its frames and truncates a torn tail.
-    pub fn open(dir: &Path, generation: u64) -> Result<(Wal, Replay)> {
+    pub(crate) fn open(dir: &Path, generation: u64) -> Result<(Wal, Replay)> {
         let path = dir.join(wal_file_name(generation));
         let mut file = OpenOptions::new()
             .read(true)
@@ -134,7 +134,7 @@ impl Wal {
         let mut data = Vec::new();
         file.read_to_end(&mut data)
             .map_err(|e| StoreError::io(&path, e))?;
-        if data.len() < HEADER_LEN as usize || &data[..4] != MAGIC {
+        if data.len() < HEADER_LEN || &data[..4] != MAGIC {
             return Err(StoreError::corrupt(&path, 0, "bad WAL header"));
         }
         let version = u16::from_le_bytes([data[4], data[5]]);
@@ -162,15 +162,11 @@ impl Wal {
             ));
         }
 
-        let mut replay = Replay::default();
-        let mut pos = HEADER_LEN as usize;
-        while let Some(frame) = next_frame(&data, pos) {
-            match decode_batch(&mut Reader::new(frame)) {
-                Some(batch) => replay.records.extend(batch),
-                None => break,
-            }
-            pos += 8 + frame.len();
-        }
+        let (records, pos) = replay_frames(&data);
+        let mut replay = Replay {
+            records,
+            truncated_bytes: 0,
+        };
         let valid = pos as u64;
         replay.truncated_bytes = data.len() as u64 - valid;
         if replay.truncated_bytes > 0 {
@@ -194,7 +190,7 @@ impl Wal {
     }
 
     /// Appends one batch as a single frame. Returns whether it is synced.
-    pub fn append(&mut self, records: &[Record], policy: SyncPolicy) -> Result<bool> {
+    pub(crate) fn append(&mut self, records: &[Record], policy: SyncPolicy) -> Result<bool> {
         if records.is_empty() {
             return Ok(!self.unsynced);
         }
@@ -231,7 +227,7 @@ impl Wal {
     }
 
     /// fsyncs pending appends (no-op when nothing is pending).
-    pub fn sync(&mut self) -> Result<()> {
+    pub(crate) fn sync(&mut self) -> Result<()> {
         if self.unsynced {
             self.file
                 .sync_data()
@@ -242,28 +238,44 @@ impl Wal {
         Ok(())
     }
 
-    pub fn generation(&self) -> u64 {
+    pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
 
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
     /// Bytes of frames (excluding the header).
-    pub fn data_len(&self) -> u64 {
-        self.len - HEADER_LEN
+    pub(crate) fn data_len(&self) -> u64 {
+        self.len - HEADER_LEN as u64
     }
 
     /// Time since this WAL was created or opened.
-    pub fn age(&self) -> Duration {
+    pub(crate) fn age(&self) -> Duration {
         self.created.elapsed()
     }
 
     #[cfg(test)]
-    pub fn has_unsynced(&self) -> bool {
+    pub(crate) fn has_unsynced(&self) -> bool {
         self.unsynced
     }
+}
+
+/// Decodes the frames of a whole WAL file (header included, not checked):
+/// the records of every valid frame up to the first bad one, and the
+/// offset where the valid prefix ends.
+pub(crate) fn replay_frames(data: &[u8]) -> (Vec<Record>, usize) {
+    let mut records = Vec::new();
+    let mut pos = HEADER_LEN.min(data.len());
+    while let Some(frame) = next_frame(data, pos) {
+        match decode_batch(&mut Reader::new(frame)) {
+            Some(batch) => records.extend(batch),
+            None => break,
+        }
+        pos += 8 + frame.len();
+    }
+    (records, pos)
 }
 
 /// Returns the payload of the frame at `pos`, if complete and valid.
@@ -278,7 +290,7 @@ fn next_frame(data: &[u8], pos: usize) -> Option<&[u8]> {
     (crc32(payload) == crc).then_some(payload)
 }
 
-fn decode_batch(r: &mut Reader<'_>) -> Option<Vec<Record>> {
+pub(crate) fn decode_batch(r: &mut Reader<'_>) -> Option<Vec<Record>> {
     let n = r.len(2).ok()?;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
@@ -330,9 +342,9 @@ mod tests {
         let dir = TempDir::new("wal-torn");
         let mut wal = Wal::create(dir.path(), 1).unwrap();
         wal.append(&[rec(1)], SyncPolicy::Always).unwrap();
-        let first_end = HEADER_LEN + wal.data_len();
+        let first_end = HEADER_LEN as u64 + wal.data_len();
         wal.append(&[rec(2), rec(3)], SyncPolicy::Always).unwrap();
-        let full_len = HEADER_LEN + wal.data_len();
+        let full_len = HEADER_LEN as u64 + wal.data_len();
         drop(wal);
         let path = dir.path().join(wal_file_name(1));
         let full = std::fs::read(&path).unwrap();
@@ -341,7 +353,7 @@ mod tests {
             let (wal, replay) = Wal::open(dir.path(), 1).unwrap();
             assert_eq!(replay.records, vec![rec(1)], "cut {cut}");
             assert_eq!(replay.truncated_bytes, cut - first_end);
-            assert_eq!(wal.data_len(), first_end - HEADER_LEN);
+            assert_eq!(wal.data_len(), first_end - HEADER_LEN as u64);
             drop(wal);
             assert_eq!(std::fs::metadata(&path).unwrap().len(), first_end);
         }
@@ -352,7 +364,7 @@ mod tests {
         let dir = TempDir::new("wal-flip");
         let mut wal = Wal::create(dir.path(), 1).unwrap();
         wal.append(&[rec(1)], SyncPolicy::Always).unwrap();
-        let first_end = (HEADER_LEN + wal.data_len()) as usize;
+        let first_end = HEADER_LEN + usize::try_from(wal.data_len()).unwrap();
         wal.append(&[rec(2)], SyncPolicy::Always).unwrap();
         wal.append(&[rec(3)], SyncPolicy::Always).unwrap();
         drop(wal);

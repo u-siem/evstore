@@ -47,7 +47,10 @@ fn crash_child() {
     // Arm the failpoint only now, so setup cannot trip it.
     // SAFETY: this test process is single-purpose; no other thread reads
     // the environment concurrently.
-    unsafe { std::env::set_var("EVSTORE_CRASH_AT", &point) };
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("EVSTORE_CRASH_AT", &point);
+    }
     if point == "wal-append-mid" {
         let _ = store.append((10..20).map(rec).collect());
     } else {
@@ -59,18 +62,18 @@ fn crash_child() {
 fn temp_dir(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("evstore-crash-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
+    std::fs::create_dir_all(&p).expect("create temp dir");
     p
 }
 
 fn run_child(dir: &Path, point: &str) {
-    let status = Command::new(std::env::current_exe().unwrap())
+    let status = Command::new(std::env::current_exe().expect("test binary path"))
         .args(["crash_child", "--exact", "--nocapture", "--test-threads=1"])
         .env("CRASH_DIR", dir)
         .env("CRASH_POINT", point)
         .env_remove("EVSTORE_CRASH_AT")
         .status()
-        .unwrap();
+        .expect("spawn crash child");
     assert!(!status.success(), "child for {point} exited cleanly");
 }
 
@@ -97,7 +100,7 @@ fn crash_at_every_failpoint() {
             "wal-append-mid" => assert!(recovery.wal_truncated_bytes > 0, "{point}: {recovery:?}"),
             "manifest-write-mid" => assert_eq!(recovery.manifests_skipped, 1, "{point}"),
             "segment-write-mid" | "flush-before-commit" | "flush-after-commit" => {
-                assert!(recovery.orphans_removed >= 1, "{point}: {recovery:?}")
+                assert!(recovery.orphans_removed >= 1, "{point}: {recovery:?}");
             }
             _ => unreachable!(),
         }

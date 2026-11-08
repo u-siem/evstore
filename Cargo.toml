@@ -5,11 +5,20 @@ edition = "2024"
 rust-version = "1.89"
 description = "Embedded, schema-aware, multi-tenant event store library for uSIEM: physically isolated tenants, fast ingest, compact storage and search."
 license = "MIT"
+repository = "https://github.com/u-siem/evstore"
+homepage = "https://github.com/u-siem/evstore"
 readme = "README.md"
 keywords = ["siem", "security", "events", "storage", "embedded"]
 categories = ["database-implementations", "data-structures"]
-# Spikes are standalone experiment crates, not part of this package.
-exclude = ["spikes/"]
+# Spikes and fuzz targets are standalone crates, not part of this package.
+include = [
+    "/src",
+    "/docs",
+    "/tests",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+]
 
 # Follow uSIEM's rule when adding dependencies: named crates with shallow
 # dependency trees only.
@@ -25,6 +34,34 @@ zstd = { version = "0.13", default-features = false }
 failpoints = []
 
 [dev-dependencies]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+# Mapping segment files (memmap2) needs `unsafe`; each use carries an
+# `#[allow(unsafe_code)]` and a `// SAFETY:` comment.
+unsafe_code = "deny"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+module_name_repetitions = "allow"
+similar_names = "allow"
+many_single_char_names = "allow"
+too_many_lines = "allow"
+unwrap_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+print_stdout = "warn"
 
 # zstd's C code is painfully slow unoptimized; keep debug test runs fast.
 [profile.dev.package.zstd-sys]

@@ -89,7 +89,7 @@ pub(crate) struct Loaded {
 }
 
 impl Manifest {
-    pub fn new(max_fields: usize) -> Manifest {
+    pub(crate) fn new(max_fields: usize) -> Manifest {
         Manifest {
             generation: 0,
             wal_generation: 1,
@@ -125,7 +125,7 @@ impl Manifest {
         out
     }
 
-    fn decode(data: &[u8], max_fields: usize) -> DResult<Manifest> {
+    pub(crate) fn decode(data: &[u8], max_fields: usize) -> DResult<Manifest> {
         if data.len() < 4 {
             return Err(DecodeError("manifest too short"));
         }
@@ -175,7 +175,7 @@ impl Manifest {
     }
 
     /// Loads the newest valid manifest in `dir`, if any exists.
-    pub fn load(dir: &Path, max_fields: usize) -> Result<Option<Loaded>> {
+    pub(crate) fn load(dir: &Path, max_fields: usize) -> Result<Option<Loaded>> {
         let mut gens = list_generations(dir)?;
         gens.sort_unstable_by(|a, b| b.cmp(a));
         let max_generation = gens.first().copied().unwrap_or(0);
@@ -196,7 +196,7 @@ impl Manifest {
                         &path,
                         8,
                         "generation does not match file name",
-                    ))
+                    ));
                 }
                 Err(e) => last_err = Some(StoreError::corrupt(&path, 0, e.0)),
             }
@@ -209,7 +209,7 @@ impl Manifest {
 
     /// Writes this manifest as generation `generation` and makes it durable,
     /// then prunes old manifests.
-    pub fn commit(&mut self, dir: &Path, generation: u64) -> Result<()> {
+    pub(crate) fn commit(&mut self, dir: &Path, generation: u64) -> Result<()> {
         self.generation = generation;
         let path = dir.join(manifest_file_name(generation));
         let data = self.encode();
@@ -254,6 +254,7 @@ fn list_generations(dir: &Path) -> Result<Vec<u64>> {
 
 /// Makes directory entries durable (Unix only; Windows has no equivalent
 /// and NTFS journals metadata).
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {

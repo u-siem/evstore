@@ -95,7 +95,7 @@ impl FieldRegistry {
     }
 
     fn insert(&mut self, name: String, ty: ValueType, mode: IndexMode) -> FieldId {
-        let id = self.fields.len() as FieldId;
+        let id = FieldId::try_from(self.fields.len()).expect("resolve and decode cap ids at u32");
         let ids = self.by_name.entry(name.clone()).or_default();
         let storage_name = if ids.is_empty() {
             name.clone()
@@ -121,7 +121,7 @@ impl FieldRegistry {
         if let Some(id) = self.get_id(name, ty) {
             return Some(id);
         }
-        if self.fields.len() > self.max_fields {
+        if self.is_full() {
             return None;
         }
         Some(self.insert(name.to_owned(), ty, IndexMode::for_field(name, ty)))
@@ -137,21 +137,21 @@ impl FieldRegistry {
 
     /// All identities of `name` (empty if unknown).
     pub fn ids(&self, name: &str) -> &[FieldId] {
-        self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[])
+        self.by_name.get(name).map_or(&[], Vec::as_slice)
     }
 
     /// Details of identity `id`.
+    ///
+    /// # Panics
+    ///
+    /// When `id` was not returned by this registry.
     pub fn info(&self, id: FieldId) -> &FieldInfo {
         &self.fields[id as usize]
     }
 
     /// All identities except the overflow field, in creation order.
     pub fn iter(&self) -> impl Iterator<Item = (FieldId, &FieldInfo)> {
-        self.fields
-            .iter()
-            .enumerate()
-            .skip(1)
-            .map(|(i, f)| (i as FieldId, f))
+        (1..).zip(self.fields.iter().skip(1))
     }
 
     /// Number of identities (excluding the overflow field).
@@ -166,7 +166,8 @@ impl FieldRegistry {
 
     /// True once new names go to the overflow field.
     pub fn is_full(&self) -> bool {
-        self.fields.len() > self.max_fields
+        // Ids are `u32`, whatever `max_fields` says.
+        self.fields.len() > self.max_fields || FieldId::try_from(self.fields.len()).is_err()
     }
 
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
@@ -181,6 +182,9 @@ impl FieldRegistry {
     pub(crate) fn decode(r: &mut Reader<'_>, max_fields: usize) -> DResult<FieldRegistry> {
         let mut reg = FieldRegistry::new(max_fields);
         let n = r.len(3)?;
+        if FieldId::try_from(n).is_err() {
+            return Err(DecodeError("too many field identities"));
+        }
         for _ in 0..n {
             let name = r.str()?.to_owned();
             let ty = ValueType::from_tag(r.u8()?).ok_or(DecodeError("unknown field type"))?;

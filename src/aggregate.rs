@@ -150,7 +150,7 @@ impl Acc {
                 *n += m;
             }
             (me @ (Acc::Min(_) | Acc::Max(_)), Acc::Min(Some(v)) | Acc::Max(Some(v))) => {
-                me.add_value(&v)
+                me.add_value(&v);
             }
             _ => {}
         }
@@ -245,8 +245,10 @@ pub(crate) fn aggregate(
     Ok(rows)
 }
 
+/// `ts` floored to a multiple of `span`; saturates at `i64::MIN` when the
+/// floor is not representable (`div_euclid(span) * span` would overflow).
 fn bucket(ts: i64, span: i64) -> i64 {
-    ts.div_euclid(span) * span
+    ts.saturating_sub(ts.rem_euclid(span))
 }
 
 /// Reference path, also used for the in-memory buffer.
@@ -260,7 +262,7 @@ fn aggregate_records(records: &[Record], q: &AggQuery, groups: &mut Groups) {
         for g in &q.group_by {
             match g {
                 GroupBy::TimeBucket { span_ns } => {
-                    key.push(value_key(&Value::Time(bucket(r.ts, *span_ns))))
+                    key.push(value_key(&Value::Time(bucket(r.ts, *span_ns))));
                 }
                 GroupBy::Field(f) => {
                     let mut vals = r.values(f);
@@ -277,7 +279,7 @@ fn aggregate_records(records: &[Record], q: &AggQuery, groups: &mut Groups) {
                 Metric::Count => *acc = Acc::Count(1),
                 Metric::CountField(f) => *acc = Acc::Count(u64::from(r.values(f).next().is_some())),
                 Metric::Sum(f) | Metric::Min(f) | Metric::Max(f) => {
-                    r.values(f).for_each(|v| acc.add_value(v))
+                    r.values(f).for_each(|v| acc.add_value(v));
                 }
             }
         }
@@ -336,13 +338,15 @@ fn aggregate_segment(seg: &Arc<Segment>, q: &AggQuery, groups: &mut Groups) -> R
         })
         .collect();
     // A group field the segment lacks (and no overflow): nothing groups.
-    if overflow.is_none() && group_fields.iter().flatten().any(|f| f.is_empty()) {
+    if overflow.is_none() && group_fields.iter().flatten().any(std::vec::Vec::is_empty) {
         return Ok(());
     }
     let mut wanted = Vec::new();
     collect_fields(&plan, &mut wanted);
     group_fields.iter().flatten().for_each(|f| wanted.extend(f));
-    metric_fields.iter().for_each(|f| wanted.extend(f));
+    for f in &metric_fields {
+        wanted.extend(f);
+    }
     wanted.extend(overflow);
     wanted.sort_unstable();
     wanted.dedup();
@@ -371,7 +375,7 @@ fn aggregate_segment(seg: &Arc<Segment>, q: &AggQuery, groups: &mut Groups) -> R
             for (g, fields) in q.group_by.iter().zip(&group_fields) {
                 match (g, fields) {
                     (GroupBy::TimeBucket { span_ns }, _) => {
-                        key.push(Part::Time(bucket(t, *span_ns)))
+                        key.push(Part::Time(bucket(t, *span_ns)));
                     }
                     (GroupBy::Field(name), Some(fields)) => {
                         match single_part(seg, &data, fields, name, row)? {
@@ -403,7 +407,7 @@ fn aggregate_segment(seg: &Arc<Segment>, q: &AggQuery, groups: &mut Groups) -> R
                         }
                     }
                     Metric::Sum(f) | Metric::Min(f) | Metric::Max(f) => {
-                        for_each_value(seg, &data, fields, f, row, &mut |v| acc.add_value(v))?
+                        for_each_value(seg, &data, fields, f, row, &mut |v| acc.add_value(v))?;
                     }
                 }
             }
@@ -583,7 +587,7 @@ mod tests {
         for i in 0..150 {
             let n_groups = rng.below(3) as usize;
             let group_by: Vec<GroupBy> = (0..n_groups).map(|_| rng.pick(&groups).clone()).collect();
-            let metrics: Vec<Metric> = (0..1 + rng.below(4))
+            let metrics: Vec<Metric> = (0..=rng.below(4))
                 .map(|_| {
                     let f = (*rng.pick(&fields)).to_string();
                     match rng.below(5) {
@@ -638,6 +642,16 @@ mod tests {
                 "query {i}: {q:?}\n got {got:?}\nwant {want:?}"
             );
         }
+    }
+
+    #[test]
+    fn bucket_floor_saturates() {
+        // `div_euclid(3) * 3` overflowed here.
+        assert_eq!(bucket(i64::MIN, 3), i64::MIN);
+        assert_eq!(bucket(i64::MIN + 1, 3), i64::MIN);
+        assert_eq!(bucket(-1, 10), -10);
+        assert_eq!(bucket(25, 10), 20);
+        assert_eq!(bucket(i64::MAX, 7), i64::MAX - i64::MAX.rem_euclid(7));
     }
 
     #[test]

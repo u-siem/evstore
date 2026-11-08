@@ -142,7 +142,7 @@ impl std::fmt::Debug for Store {
             .field("dir", &self.dir)
             .field("segments", &self.segments.len())
             .field("buffered", &self.buffer.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -150,12 +150,23 @@ impl std::fmt::Debug for Store {
 pub fn now_ns() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
 }
 
 impl Store {
     /// Opens (or creates) the store in `dir`, recovering from any crash.
+    ///
+    /// Recovery replays the WAL (cutting a torn tail), falls back past torn
+    /// manifests and deletes files the manifest does not reference; see
+    /// [`Store::recovery`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidArgument`] for zero `chunk_rows` or
+    /// `flush_bytes`, [`StoreError::Locked`] when another owner holds the
+    /// directory, [`StoreError::Corrupt`] when no manifest validates or a
+    /// live segment or the WAL header fails validation, and
+    /// [`StoreError::Io`] for file system errors.
     pub fn open(dir: impl AsRef<Path>, opts: Options) -> Result<Store> {
         if opts.chunk_rows == 0 || opts.flush_bytes == 0 {
             return Err(StoreError::InvalidArgument(
@@ -180,12 +191,11 @@ impl Store {
         }
 
         let mut recovery = Recovery::default();
-        let (mut manifest, mut max_generation) = match Manifest::load(&dir, opts.max_fields)? {
-            Some(loaded) => {
+        let (mut manifest, mut max_generation) =
+            if let Some(loaded) = Manifest::load(&dir, opts.max_fields)? {
                 recovery.manifests_skipped = loaded.skipped;
                 (loaded.manifest, loaded.max_generation)
-            }
-            None => {
+            } else {
                 // Fresh store: anything here is debris from an interrupted init.
                 remove_matching(&dir, |n| {
                     parse_wal_name(n).is_some() || parse_segment_name(n).is_some()
@@ -194,15 +204,23 @@ impl Store {
                 Wal::create(&dir, m.wal_generation)?;
                 m.commit(&dir, 1)?;
                 (m, 1)
-            }
-        };
+            };
         max_generation = max_generation.max(manifest.generation);
 
         let mut segments = Vec::with_capacity(manifest.segments.len());
         for entry in &manifest.segments {
-            segments.push(Arc::new(Segment::open(
-                &dir.join(segment_file_name(entry.id)),
-            )?));
+            let path = dir.join(segment_file_name(entry.id));
+            let seg = Segment::open(&path)?;
+            // The manifest's copy of the summary must describe this file;
+            // counts and sizes are summed from it.
+            if seg.rows != entry.rows || seg.file_len() != entry.bytes {
+                return Err(StoreError::corrupt(
+                    &path,
+                    0,
+                    "segment does not match its manifest entry",
+                ));
+            }
+            segments.push(Arc::new(seg));
         }
 
         let wal_path = dir.join(crate::wal::wal_file_name(manifest.wal_generation));
@@ -211,7 +229,7 @@ impl Store {
         } else {
             (
                 Wal::create(&dir, manifest.wal_generation)?,
-                Default::default(),
+                crate::wal::Replay::default(),
             )
         };
         recovery.wal_records = replay.records.len();
@@ -225,7 +243,7 @@ impl Store {
         })?;
         // Ids above anything on disk, even if a manifest recorded less.
         if let Some(max) = live_segments.iter().max() {
-            manifest.next_segment = manifest.next_segment.max(max + 1);
+            manifest.next_segment = manifest.next_segment.max(max.saturating_add(1));
         }
 
         register_fields(&mut manifest.registry, &replay.records);
@@ -265,6 +283,14 @@ impl Store {
     /// synced (see [`Ack::synced`]). A batch is atomic across crashes.
     ///
     /// Flushes into a segment when the buffer exceeds `flush_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidArgument`] when a record uses the reserved
+    /// [`OVERFLOW_FIELD`](crate::OVERFLOW_FIELD) name or the batch encodes
+    /// to more than 256 MiB; otherwise the errors of writing the WAL and,
+    /// when the buffer is full, of [`flush`](Store::flush). Nothing is
+    /// appended when the WAL write fails.
     pub fn append(&mut self, records: Vec<Record>) -> Result<Ack> {
         if records
             .iter()
@@ -292,17 +318,33 @@ impl Store {
     }
 
     /// fsyncs pending WAL appends.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] when the sync fails.
     pub fn sync(&mut self) -> Result<()> {
         self.wal.sync()
     }
 
     /// Runs a query.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Corrupt`] or [`StoreError::Io`] when a segment
+    /// dictionary or index needed to plan the query cannot be read; errors
+    /// while scanning are yielded by the iterator, which then ends.
     pub fn search(&self, query: &Query) -> Result<RecordIter> {
         query::execute(&self.segments, &self.buffer, query)
     }
 
     /// Runs an aggregation (see [`AggQuery`](crate::AggQuery)). Row order
     /// is unspecified.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidArgument`] for a time bucket span that is not
+    /// positive, and [`StoreError::Corrupt`] or [`StoreError::Io`] when a
+    /// segment cannot be read.
     pub fn aggregate(&self, query: &crate::AggQuery) -> Result<Vec<crate::AggRow>> {
         crate::aggregate::aggregate(&self.segments, &self.buffer, query)
     }
@@ -363,6 +405,13 @@ impl Store {
 
     /// Flushes buffered records into a new segment (and persists pending
     /// application metadata).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] when writing the segment, the new WAL or the
+    /// manifest fails; the buffered records then stay in the old WAL, which
+    /// remains authoritative. [`StoreError::InvalidArgument`] when a
+    /// generation or segment id read from disk is exhausted.
     pub fn flush(&mut self) -> Result<()> {
         self.flush_at(now_ns())
     }
@@ -370,6 +419,12 @@ impl Store {
     /// Periodic housekeeping: sync the WAL, flush it when due, apply
     /// retention, compact, and retry deferred deletions. `now_ns` is the
     /// wall-clock time used for ingest days and retention.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`sync`](Store::sync) and [`flush`](Store::flush),
+    /// plus [`StoreError::Corrupt`] or [`StoreError::Io`] when a segment
+    /// cannot be read or written during compaction.
     pub fn maintain(&mut self, now_ns: i64) -> Result<MaintainReport> {
         let mut report = MaintainReport::default();
         self.wal.sync()?;
@@ -391,9 +446,9 @@ impl Store {
         Ok(report)
     }
 
-    fn next_generation(&mut self) -> u64 {
-        self.max_generation += 1;
-        self.max_generation
+    fn next_generation(&mut self) -> Result<u64> {
+        self.max_generation = bump(self.max_generation, "manifest generation")?;
+        Ok(self.max_generation)
     }
 
     /// Moves fields the registry cannot hold into the overflow field.
@@ -419,7 +474,7 @@ impl Store {
         if self.buffer.is_empty() {
             self.wal.sync()?;
             if self.app_meta_dirty {
-                let generation = self.next_generation();
+                let generation = self.next_generation()?;
                 self.manifest.commit(&self.dir, generation)?;
                 self.app_meta_dirty = false;
             }
@@ -451,10 +506,10 @@ impl Store {
         drop(packed);
         crate::failpoint("flush-before-commit", || {});
 
-        let new_wal = Wal::create(&self.dir, self.wal.generation() + 1)?;
+        let new_wal = Wal::create(&self.dir, bump(self.wal.generation(), "WAL generation")?)?;
         let mut next = self.manifest.clone();
         next.registry = registry;
-        next.next_segment = id + 1;
+        next.next_segment = bump(id, "segment id")?;
         next.wal_generation = new_wal.generation();
         next.segments.push(SegmentEntry {
             id,
@@ -465,7 +520,7 @@ impl Store {
             bytes: summary.bytes,
             level: 0,
         });
-        let generation = self.next_generation();
+        let generation = self.next_generation()?;
         if let Err(e) = next.commit(&self.dir, generation) {
             // The old manifest and WAL stay authoritative.
             let _ = fs::remove_file(new_wal.path());
@@ -494,7 +549,7 @@ impl Store {
         }
         let mut next = self.manifest.clone();
         next.segments.retain(|s| !expired.contains(&s.id));
-        let generation = self.next_generation();
+        let generation = self.next_generation()?;
         next.commit(&self.dir, generation)?;
         self.manifest = next;
         self.app_meta_dirty = false;
@@ -551,7 +606,7 @@ impl Store {
         let day = inputs[0].0.day;
         let level = inputs.iter().map(|(e, _)| e.level).max().unwrap_or(0) + 1;
         next.segments.retain(|s| !ids.contains(&s.id));
-        next.next_segment = id + 1;
+        next.next_segment = bump(id, "segment id")?;
         // Keep the list ordered by id (oldest first).
         next.segments.push(SegmentEntry {
             id,
@@ -562,7 +617,7 @@ impl Store {
             bytes: summary.bytes,
             level,
         });
-        let generation = self.next_generation();
+        let generation = self.next_generation()?;
         if let Err(e) = next.commit(&self.dir, generation) {
             let _ = fs::remove_file(&path);
             return Err(e);
@@ -659,7 +714,9 @@ fn merged_encodings(
         .into_iter()
         .map(|(name, set)| {
             let enc = match set {
-                Some(set) if !choose_plain(set.len(), rows as usize) => {
+                Some(set)
+                    if !choose_plain(set.len(), usize::try_from(rows).unwrap_or(usize::MAX)) =>
+                {
                     StrEncoding::Dict(set.into_iter().collect())
                 }
                 _ => StrEncoding::Plain,
@@ -667,6 +724,12 @@ fn merged_encodings(
             (name, enc)
         })
         .collect())
+}
+
+/// `n + 1`, or an error once a counter read from disk is exhausted.
+fn bump(n: u64, what: &str) -> Result<u64> {
+    n.checked_add(1)
+        .ok_or_else(|| StoreError::InvalidArgument(format!("{what} space exhausted")))
 }
 
 /// Registers the fields of `records` (the registry then also describes
@@ -1005,5 +1068,40 @@ mod tests {
         s.flush().unwrap();
         drop(s);
         assert_eq!(Store::open(dir.path(), small()).unwrap().len(), 11);
+    }
+
+    #[test]
+    fn manifest_entry_must_match_its_segment() {
+        let dir = TempDir::new("store-entry");
+        {
+            let mut s = Store::open(dir.path(), small()).unwrap();
+            s.append((0..20).map(rec).collect()).unwrap();
+            s.flush().unwrap();
+        }
+        // A manifest claiming more rows than the file holds (sums of these
+        // counts overflowed before).
+        let loaded = Manifest::load(dir.path(), 2000).unwrap().unwrap();
+        let mut m = loaded.manifest;
+        m.segments[0].rows = u64::MAX;
+        m.commit(dir.path(), loaded.max_generation + 1).unwrap();
+        assert!(matches!(
+            Store::open(dir.path(), small()),
+            Err(StoreError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn exhausted_generation_is_an_error_not_an_overflow() {
+        let dir = TempDir::new("store-gen");
+        drop(Store::open(dir.path(), small()).unwrap());
+        // A stray (invalid) manifest at the top of the generation space.
+        std::fs::write(dir.path().join("manifest-ffffffffffffffff"), b"junk").unwrap();
+        let mut s = Store::open(dir.path(), small()).unwrap();
+        assert_eq!(s.recovery().manifests_skipped, 1);
+        s.append((0..3).map(rec).collect()).unwrap();
+        assert!(matches!(s.flush(), Err(StoreError::InvalidArgument(_))));
+        // The records stay in the WAL.
+        drop(s);
+        assert_eq!(Store::open(dir.path(), small()).unwrap().len(), 3);
     }
 }

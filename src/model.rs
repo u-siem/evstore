@@ -130,7 +130,7 @@ impl Value {
 /// of different types (`I64`, `U64`, `F64`) compare numerically. Anything
 /// else is incomparable (`None`).
 pub(crate) fn compare(a: &Value, b: &Value) -> Option<Ordering> {
-    use Value::*;
+    use Value::{Bool, Bytes, F64, I64, Ip, Str, Time, U64};
     Some(match (a, b) {
         (Str(x), Str(y)) => cmp_ci(x, y),
         (I64(x), I64(y)) | (Time(x), Time(y)) => x.cmp(y),

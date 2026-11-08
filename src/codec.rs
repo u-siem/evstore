@@ -16,15 +16,20 @@ pub(crate) struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    pub fn new(buf: &'a [u8]) -> Self {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
         Reader { buf, pos: 0 }
     }
 
-    pub fn is_empty(&self) -> bool {
+    /// Bytes left to read.
+    pub(crate) fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
         self.pos >= self.buf.len()
     }
 
-    pub fn bytes(&mut self, n: usize) -> DResult<&'a [u8]> {
+    pub(crate) fn bytes(&mut self, n: usize) -> DResult<&'a [u8]> {
         let end = self
             .pos
             .checked_add(n)
@@ -44,29 +49,29 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
-    pub fn u8(&mut self) -> DResult<u8> {
+    pub(crate) fn u8(&mut self) -> DResult<u8> {
         Ok(self.array::<1>()?[0])
     }
-    pub fn u16(&mut self) -> DResult<u16> {
+    pub(crate) fn u16(&mut self) -> DResult<u16> {
         Ok(u16::from_le_bytes(self.array()?))
     }
-    pub fn u32(&mut self) -> DResult<u32> {
+    pub(crate) fn u32(&mut self) -> DResult<u32> {
         Ok(u32::from_le_bytes(self.array()?))
     }
-    pub fn u64(&mut self) -> DResult<u64> {
+    pub(crate) fn u64(&mut self) -> DResult<u64> {
         Ok(u64::from_le_bytes(self.array()?))
     }
-    pub fn i64(&mut self) -> DResult<i64> {
+    pub(crate) fn i64(&mut self) -> DResult<i64> {
         Ok(i64::from_le_bytes(self.array()?))
     }
-    pub fn u128(&mut self) -> DResult<u128> {
+    pub(crate) fn u128(&mut self) -> DResult<u128> {
         Ok(u128::from_le_bytes(self.array()?))
     }
-    pub fn f64(&mut self) -> DResult<f64> {
+    pub(crate) fn f64(&mut self) -> DResult<f64> {
         Ok(f64::from_le_bytes(self.array()?))
     }
 
-    pub fn uvarint(&mut self) -> DResult<u64> {
+    pub(crate) fn uvarint(&mut self) -> DResult<u64> {
         let mut out = 0u64;
         for shift in (0..64).step_by(7) {
             let b = self.u8()?;
@@ -81,14 +86,14 @@ impl<'a> Reader<'a> {
         Err(DecodeError("varint too long"))
     }
 
-    pub fn ivarint(&mut self) -> DResult<i64> {
+    pub(crate) fn ivarint(&mut self) -> DResult<i64> {
         let z = self.uvarint()?;
-        Ok(((z >> 1) as i64) ^ -((z & 1) as i64))
+        Ok((z >> 1).cast_signed() ^ -(z & 1).cast_signed())
     }
 
     /// A `uvarint` used as a length or count, bounded by the remaining input
     /// (each counted item takes at least `min_item` bytes).
-    pub fn len(&mut self, min_item: usize) -> DResult<usize> {
+    pub(crate) fn len(&mut self, min_item: usize) -> DResult<usize> {
         let n = usize::try_from(self.uvarint()?).map_err(|_| DecodeError("length overflow"))?;
         let remaining = self.buf.len().saturating_sub(self.pos);
         if n.saturating_mul(min_item.max(1)) > remaining && min_item > 0 {
@@ -97,26 +102,26 @@ impl<'a> Reader<'a> {
         Ok(n)
     }
 
-    pub fn lp_bytes(&mut self) -> DResult<&'a [u8]> {
+    pub(crate) fn lp_bytes(&mut self) -> DResult<&'a [u8]> {
         let n = self.len(1)?;
         self.bytes(n)
     }
 
-    pub fn str(&mut self) -> DResult<&'a str> {
+    pub(crate) fn str(&mut self) -> DResult<&'a str> {
         std::str::from_utf8(self.lp_bytes()?).map_err(|_| DecodeError("invalid UTF-8"))
     }
 }
 
 pub(crate) fn put_uvarint(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
-        out.push((v as u8) | 0x80);
+        out.push(v.to_le_bytes()[0] | 0x80);
         v >>= 7;
     }
-    out.push(v as u8);
+    out.push(v.to_le_bytes()[0]);
 }
 
 pub(crate) fn put_ivarint(out: &mut Vec<u8>, v: i64) {
-    put_uvarint(out, ((v << 1) ^ (v >> 63)) as u64);
+    put_uvarint(out, ((v << 1) ^ (v >> 63)).cast_unsigned());
 }
 
 pub(crate) fn put_len(out: &mut Vec<u8>, n: usize) {
