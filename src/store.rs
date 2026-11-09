@@ -129,7 +129,8 @@ pub struct Store {
     max_generation: u64,
     segments: Vec<Arc<Segment>>,
     wal: Wal,
-    buffer: Vec<Record>,
+    /// Shared so queries can hold buffered records without copying them.
+    buffer: Vec<Arc<Record>>,
     buffer_bytes: usize,
     pending_delete: Vec<PathBuf>,
     app_meta_dirty: bool,
@@ -256,7 +257,7 @@ impl Store {
             max_generation,
             segments,
             wal,
-            buffer: replay.records,
+            buffer: replay.records.into_iter().map(Arc::new).collect(),
             buffer_bytes,
             pending_delete: Vec::new(),
             app_meta_dirty: false,
@@ -304,7 +305,7 @@ impl Store {
         register_fields(&mut self.manifest.registry, &records);
         let appended = records.len();
         self.buffer_bytes += records.iter().map(Record::approx_size).sum::<usize>();
-        self.buffer.extend(records);
+        self.buffer.extend(records.into_iter().map(Arc::new));
         let mut synced = synced;
         if self.buffer_bytes >= self.opts.flush_bytes {
             self.flush_at(now_ns())?;
@@ -490,12 +491,12 @@ impl Store {
                 .iter()
                 .all(|(n, v)| registry.resolve(n, v.value_type()).is_some());
             if !fits {
-                let mut copy = r.clone();
+                let mut copy = Record::clone(r);
                 Self::pack_overflow(&mut registry, &mut copy);
                 packed.push((i, copy));
             }
         }
-        let mut rows: Vec<&Record> = self.buffer.iter().collect();
+        let mut rows: Vec<&Record> = self.buffer.iter().map(|r| &**r).collect();
         for (i, r) in &packed {
             rows[*i] = r;
         }

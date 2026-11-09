@@ -232,6 +232,60 @@ struct CompiledOp {
     op: FieldOp,
     /// Lowercase string literals, for string comparisons.
     lower: Vec<String>,
+    /// Shape of a `Glob` pattern (`None` for other operators).
+    glob: Option<GlobShape>,
+}
+
+/// A glob pattern classified once, so common shapes skip backtracking.
+#[derive(Debug)]
+enum GlobShape {
+    /// Only `*`s: matches everything.
+    Any,
+    /// No wildcard: whole-string equality.
+    Exact(String),
+    /// `lit*`.
+    Prefix(String),
+    /// `*lit`.
+    Suffix(String),
+    /// `*lit*`.
+    Contains(String),
+    /// Anything else.
+    General,
+}
+
+impl GlobShape {
+    /// Classifies a lowercase pattern.
+    fn of(pattern: &str) -> GlobShape {
+        let core = pattern.trim_matches('*');
+        if core.contains(['*', '?']) {
+            return GlobShape::General;
+        }
+        if core.is_empty() {
+            return if pattern.is_empty() {
+                GlobShape::Exact(String::new())
+            } else {
+                GlobShape::Any
+            };
+        }
+        let lit = core.to_string();
+        match (pattern.starts_with('*'), pattern.ends_with('*')) {
+            (true, true) => GlobShape::Contains(lit),
+            (true, false) => GlobShape::Suffix(lit),
+            (false, true) => GlobShape::Prefix(lit),
+            (false, false) => GlobShape::Exact(lit),
+        }
+    }
+
+    fn matches(&self, pattern: &str, s: &str) -> bool {
+        match self {
+            GlobShape::Any => true,
+            GlobShape::Exact(l) => s == l,
+            GlobShape::Prefix(l) => s.starts_with(l.as_str()),
+            GlobShape::Suffix(l) => s.ends_with(l.as_str()),
+            GlobShape::Contains(l) => s.contains(l.as_str()),
+            GlobShape::General => glob_match(pattern, s),
+        }
+    }
 }
 
 impl CompiledOp {
@@ -259,9 +313,24 @@ impl CompiledOp {
                 .collect(),
             _ => Vec::new(),
         };
+        let glob = match op {
+            FieldOp::Glob(_) => Some(GlobShape::of(&lower[0])),
+            _ => None,
+        };
         CompiledOp {
             op: op.clone(),
             lower,
+            glob,
+        }
+    }
+
+    /// Answers the predicate for a field that has at least one value
+    /// without looking at the values, when the operator allows it.
+    fn on_presence(&self, ty: ValueType) -> Option<bool> {
+        match &self.op {
+            FieldOp::Exists => Some(true),
+            FieldOp::HasType(t) => Some(*t == ty),
+            _ => None,
         }
     }
 
@@ -273,7 +342,10 @@ impl CompiledOp {
             FieldOp::In(_) => self.lower.iter().any(|l| l == s),
             FieldOp::Prefix(_) => s.starts_with(self.lower[0].as_str()),
             FieldOp::Contains(_) => s.contains(self.lower[0].as_str()),
-            FieldOp::Glob(_) => glob_match(&self.lower[0], s),
+            FieldOp::Glob(_) => self
+                .glob
+                .as_ref()
+                .is_some_and(|g| g.matches(&self.lower[0], s)),
             FieldOp::Range { lower, upper } => {
                 let ok_lo = match lower {
                     None => true,
@@ -338,14 +410,34 @@ impl CompiledOp {
     }
 }
 
-/// Calls `f` with the lowercase form of `s`, allocating only when `s` has
-/// uppercase or non-ASCII characters.
+std::thread_local! {
+    /// Reused buffer for lowercasing ASCII values in scans.
+    static LOWER: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Calls `f` with the lowercase form of `s`. ASCII text is lowercased into
+/// a reused per-thread buffer; only non-ASCII text allocates (it needs the
+/// full Unicode rules of `str::to_lowercase`).
 fn with_lower<T>(s: &str, f: impl FnOnce(&str) -> T) -> T {
-    if s.bytes().all(|b| b.is_ascii() && !b.is_ascii_uppercase()) {
-        f(s)
-    } else {
-        f(&s.to_lowercase())
+    let mut upper = false;
+    for b in s.bytes() {
+        if !b.is_ascii() {
+            return f(&s.to_lowercase());
+        }
+        upper |= b.is_ascii_uppercase();
     }
+    if !upper {
+        return f(s);
+    }
+    LOWER.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut buf) => {
+            buf.clear();
+            buf.push_str(s);
+            buf.make_ascii_lowercase();
+            f(&buf)
+        }
+        Err(_) => f(&s.to_ascii_lowercase()),
+    })
 }
 
 fn within(v: &Value, lo: &Value, hi: &Value) -> bool {
@@ -374,28 +466,44 @@ fn range_ok(v: &Value, lower: Option<&(Value, bool)>, upper: Option<&(Value, boo
     lo && hi
 }
 
-/// Glob match over characters: `*` matches any run, `?` one character.
+/// Glob match: `*` matches any run of characters, `?` one character. Every
+/// `*` and `?` in the pattern is a wildcard (there is no escaping).
+///
+/// Works on UTF-8 bytes without allocating: literals compare byte by byte,
+/// and `?` or a backtracking `*` advance by a whole character, so positions
+/// in `text` always stay on character boundaries.
 pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
+    fn char_len(lead: u8) -> usize {
+        match lead {
+            0x00..=0x7f => 1,
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            _ => 4,
+        }
+    }
+    let (p, t) = (pattern.as_bytes(), text.as_bytes());
     let (mut pi, mut ti) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
     while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
+        if pi < p.len() && p[pi] == b'*' {
             star = Some((pi, ti));
             pi += 1;
+        } else if pi < p.len() && p[pi] == b'?' {
+            pi += 1;
+            ti += char_len(t[ti]);
+        } else if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
         } else if let Some((sp, st)) = star {
+            let next = st + char_len(t[st]);
             pi = sp + 1;
-            ti = st + 1;
-            star = Some((sp, st + 1));
+            ti = next;
+            star = Some((sp, next));
         } else {
             return false;
         }
     }
-    p[pi..].iter().all(|c| *c == '*')
+    p[pi..].iter().all(|c| *c == b'*')
 }
 
 // ---------------------------------------------------------------------------
@@ -684,6 +792,12 @@ pub(crate) fn eval(plan: &Plan, data: &ChunkData, row: usize) -> bool {
                 };
                 let range = col.range(row);
                 if range.is_empty() {
+                    continue;
+                }
+                if let Some(hit) = leaf.op.on_presence(col.ty) {
+                    if hit {
+                        return true;
+                    }
                     continue;
                 }
                 let hit = match &col.data {
@@ -1000,7 +1114,7 @@ impl Iterator for Merge {
 /// in-memory buffer (ingest order).
 pub(crate) fn execute(
     segments: &[Arc<Segment>],
-    buffer: &[Record],
+    buffer: &[Arc<Record>],
     query: &Query,
 ) -> Result<RecordIter> {
     let desc = query.order == Order::Desc;
@@ -1012,8 +1126,10 @@ pub(crate) fn execute(
             sources.push((bound, Box::new(scan)));
         }
     }
+    // Buffered matches are shared, not copied: each record is cloned only
+    // when the merge emits it.
     let rf = RecordFilter::new(&query.filter);
-    let mut mem: Vec<Record> = buffer
+    let mut mem: Vec<Arc<Record>> = buffer
         .iter()
         .filter(|r| query.time.contains(r.ts) && rf.matches(r))
         .cloned()
@@ -1025,7 +1141,10 @@ pub(crate) fn execute(
         }
     }
     if let Some(first) = mem.first() {
-        sources.push((first.ts, Box::new(mem.into_iter().map(Ok))));
+        sources.push((
+            first.ts,
+            Box::new(mem.into_iter().map(|r| Ok(Record::clone(&r)))),
+        ));
     }
     let iter: RecordIter = if query.order == Order::Storage {
         Box::new(sources.into_iter().flat_map(|(_, s)| s))
@@ -1053,6 +1172,49 @@ pub(crate) mod tests {
         assert!(glob_match("*.exe", "c:\\x\\cmd.exe"));
         assert!(!glob_match("*.exe", "cmd.exe.txt"));
         assert!(glob_match("*a*b*", "xxaxxbxx"));
+        // `?` takes one character, however many bytes it has.
+        assert!(glob_match("a?c", "aäc"));
+        assert!(glob_match("?", "€"));
+        assert!(!glob_match("??", "€"));
+        assert!(glob_match("*ä*", "xxäxx"));
+        assert!(glob_match("ä*€", "äxx€"));
+        // A `*` in the pattern is a wildcard even facing a `*` in the text.
+        assert!(glob_match("*a*", "*ba"));
+        assert!(glob_match("*a", "*ba"));
+    }
+
+    #[test]
+    fn glob_shapes_agree_with_general_matching() {
+        let mut rng = Rng::new(0x61ab);
+        let alphabet = ['a', 'b', 'ä', '*', '?', '€'];
+        let gen_str = |rng: &mut Rng, max: u64| -> String {
+            (0..rng.below(max))
+                .map(|_| *rng.pick(&alphabet))
+                .collect::<String>()
+        };
+        for _ in 0..20_000 {
+            let pattern = gen_str(&mut rng, 6);
+            let text = gen_str(&mut rng, 8).replace('?', "a");
+            let shape = GlobShape::of(&pattern);
+            assert_eq!(
+                shape.matches(&pattern, &text),
+                glob_match(&pattern, &text),
+                "{pattern:?} vs {text:?} ({shape:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn lowercasing_reuses_a_buffer_and_keeps_unicode_rules() {
+        assert_eq!(with_lower("ABC def", str::to_owned), "abc def");
+        assert_eq!(with_lower("plain", str::to_owned), "plain");
+        // Final sigma needs `str::to_lowercase`, not per-character rules.
+        assert_eq!(with_lower("ΟΔΟΣ", str::to_owned), "οδος");
+        // Nested use falls back instead of panicking on the shared buffer.
+        assert_eq!(
+            with_lower("AB", |a| with_lower("CD", |b| format!("{a}{b}"))),
+            "abcd"
+        );
     }
 
     #[test]
@@ -1264,8 +1426,8 @@ pub(crate) mod tests {
             segments.push(Arc::new(Segment::open(&path).unwrap()));
             all.extend(rows);
         }
-        let buffer = gen_rows(&mut rng, 500);
-        all.extend(buffer.iter().cloned());
+        let buffer: Vec<Arc<Record>> = gen_rows(&mut rng, 500).into_iter().map(Arc::new).collect();
+        all.extend(buffer.iter().map(|r| Record::clone(r)));
         let by_id: HashMap<u64, Record> =
             all.iter().map(|r| (rid(r), normalize(r.clone()))).collect();
 

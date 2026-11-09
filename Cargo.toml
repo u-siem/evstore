@@ -15,6 +15,7 @@ include = [
     "/src",
     "/docs",
     "/tests",
+    "/benches",
     "/README.md",
     "/CHANGELOG.md",
     "/LICENSE",
@@ -70,3 +71,7 @@ opt-level = 3
 [[test]]
 name = "crash"
 required-features = ["failpoints"]
+
+[[bench]]
+name = "query"
+harness = false

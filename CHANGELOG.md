@@ -7,6 +7,28 @@ with no prefix (`0.1.0`).
 
 ## [Unreleased]
 
+### Changed
+
+- Faster string matching in scans: ASCII values are lowercased into a
+  reused buffer instead of a new allocation per value, globs match on UTF-8
+  bytes without allocating, and the common `*lit*`, `lit*`, `*lit` and
+  wildcard-free shapes skip backtracking.
+- `Exists` and `HasType` leaves are answered from value presence without
+  materializing values.
+- Aggregations keep integer, time, boolean and IP group keys unencoded and
+  look each group up once per row.
+- Searches share the matching records of the in-memory buffer instead of
+  copying them all; a record is cloned only when it is emitted (a
+  newest-first query with a limit no longer copies the whole buffer).
+- `benches/query.rs`: query and aggregation benchmarks (`cargo bench`).
+
+### Fixed
+
+- `FieldOp::Glob`: a `*` in the pattern facing a literal `*` in the text
+  is now always a wildcard (`*a*` matches `*ba`); it used to be matched as
+  a literal first, without backtracking.
+
+
 ## [0.1.0]
 
 First public release.

@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use crate::codec::{Reader, get_tagged, put_tagged};
 use crate::error::{Result, StoreError};
-use crate::model::{Record, Value, compare};
+use crate::model::{Record, Value, ValueType, compare};
 use crate::query::{
     ChunkData, Filter, Plan, RecordFilter, TimeRange, candidates, chunk_has_candidates,
     collect_fields, compile, eval, may_match,
@@ -185,12 +185,37 @@ fn value_key(v: &Value) -> Vec<u8> {
     out
 }
 
-/// Group key part inside one segment: dictionary codes stay codes.
+/// Group key part inside one segment: dictionary codes stay codes, and
+/// fixed-size values stay unencoded (no allocation per row).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Part {
     Code(u32, u32),
     Time(i64),
+    I64(i64),
+    U64(u64),
+    Bool(bool),
+    Ip(u128),
     Bytes(Vec<u8>),
+}
+
+impl Part {
+    /// Encoded key part, as [`value_key`] writes it.
+    fn encode(self, seg: &Segment) -> Result<Vec<u8>> {
+        Ok(match self {
+            Part::Bytes(b) => b,
+            Part::Time(t) => value_key(&Value::Time(t)),
+            Part::I64(x) => value_key(&Value::I64(x)),
+            Part::U64(x) => value_key(&Value::U64(x)),
+            Part::Bool(x) => value_key(&Value::Bool(x)),
+            Part::Ip(x) => value_key(&Value::Ip(x)),
+            Part::Code(field, code) => {
+                let dict = seg
+                    .field_dict(field)?
+                    .expect("coded field has a dictionary");
+                value_key(&Value::Str(dict.get(code).to_owned()))
+            }
+        })
+    }
 }
 
 type Groups = HashMap<Vec<Vec<u8>>, Vec<Acc>>;
@@ -211,7 +236,7 @@ fn merge_into(groups: &mut Groups, key: Vec<Vec<u8>>, accs: Vec<Acc>) {
 /// Runs `q` over the segments and the WAL buffer.
 pub(crate) fn aggregate(
     segments: &[Arc<Segment>],
-    buffer: &[Record],
+    buffer: &[Arc<Record>],
     q: &AggQuery,
 ) -> Result<Vec<AggRow>> {
     for g in &q.group_by {
@@ -227,7 +252,7 @@ pub(crate) fn aggregate(
     for seg in segments {
         aggregate_segment(seg, q, &mut groups)?;
     }
-    aggregate_records(buffer, q, &mut groups);
+    aggregate_records(buffer.iter().map(|r| &**r), q, &mut groups);
     if q.group_by.is_empty() && groups.is_empty() {
         groups.insert(Vec::new(), q.metrics.iter().map(Acc::new).collect());
     }
@@ -252,7 +277,11 @@ fn bucket(ts: i64, span: i64) -> i64 {
 }
 
 /// Reference path, also used for the in-memory buffer.
-fn aggregate_records(records: &[Record], q: &AggQuery, groups: &mut Groups) {
+fn aggregate_records<'a>(
+    records: impl IntoIterator<Item = &'a Record>,
+    q: &AggQuery,
+    groups: &mut Groups,
+) {
     let filter = RecordFilter::new(&q.filter);
     'rows: for r in records {
         if !q.time.contains(r.ts) || !filter.matches(r) {
@@ -386,30 +415,38 @@ fn aggregate_segment(seg: &Arc<Segment>, q: &AggQuery, groups: &mut Groups) -> R
                     (GroupBy::Field(_), None) => unreachable!("field groups have fields"),
                 }
             }
-            // Update the group's accumulators in place (no per-row allocation
-            // once the group exists).
-            if !local.contains_key(&key) {
-                local.insert(key.clone(), q.metrics.iter().map(Acc::new).collect());
-            }
-            let accs = local.get_mut(&key).expect("just inserted");
-            for ((m, acc), fields) in q.metrics.iter().zip(accs.iter_mut()).zip(&metric_fields) {
-                match m {
-                    Metric::Count => {
-                        if let Acc::Count(n) = acc {
-                            *n += 1;
+            // Update the group's accumulators in place: one lookup and no
+            // allocation per row once the group exists.
+            let update = |accs: &mut [Acc]| -> Result<()> {
+                for ((m, acc), fields) in q.metrics.iter().zip(accs).zip(&metric_fields) {
+                    match m {
+                        Metric::Count => {
+                            if let Acc::Count(n) = acc {
+                                *n += 1;
+                            }
                         }
-                    }
-                    Metric::CountField(f) => {
-                        let mut any = false;
-                        for_each_value(seg, &data, fields, f, row, &mut |_| any = true)?;
-                        if let Acc::Count(n) = acc {
-                            *n += u64::from(any);
+                        Metric::CountField(f) => {
+                            let mut any = false;
+                            for_each_value(seg, &data, fields, f, row, &mut |_| any = true)?;
+                            if let Acc::Count(n) = acc {
+                                *n += u64::from(any);
+                            }
                         }
-                    }
-                    Metric::Sum(f) | Metric::Min(f) | Metric::Max(f) => {
-                        for_each_value(seg, &data, fields, f, row, &mut |v| acc.add_value(v))?;
+                        Metric::Sum(f) | Metric::Min(f) | Metric::Max(f) => {
+                            for_each_value(seg, &data, fields, f, row, &mut |v| {
+                                acc.add_value(v);
+                            })?;
+                        }
                     }
                 }
+                Ok(())
+            };
+            if let Some(accs) = local.get_mut(&key) {
+                update(accs)?;
+            } else {
+                let mut accs: Vec<Acc> = q.metrics.iter().map(Acc::new).collect();
+                update(&mut accs)?;
+                local.insert(key.clone(), accs);
             }
         }
     }
@@ -417,16 +454,7 @@ fn aggregate_segment(seg: &Arc<Segment>, q: &AggQuery, groups: &mut Groups) -> R
     for (key, accs) in local {
         let mut out = Vec::with_capacity(key.len());
         for part in key {
-            out.push(match part {
-                Part::Bytes(b) => b,
-                Part::Time(t) => value_key(&Value::Time(t)),
-                Part::Code(field, code) => {
-                    let dict = seg
-                        .field_dict(field)?
-                        .expect("coded field has a dictionary");
-                    value_key(&Value::Str(dict.get(code).to_owned()))
-                }
-            });
+            out.push(part.encode(seg)?);
         }
         merge_into(groups, out, accs);
     }
@@ -468,6 +496,11 @@ fn single_part(
         if let Some(i) = range.clone().next() {
             found = Some(match &col.data {
                 ColData::Str(codes) => Part::Code(*f, codes[i]),
+                ColData::Int(v) if col.ty == ValueType::Time => Part::Time(v[i]),
+                ColData::Int(v) => Part::I64(v[i]),
+                ColData::U64(v) => Part::U64(v[i]),
+                ColData::Bool(v) => Part::Bool(v[i]),
+                ColData::Ip(v) => Part::Ip(v[i]),
                 _ => Part::Bytes(value_key(&col.value(i, seg.field_dict(*f)?))),
             });
         }
@@ -566,13 +599,13 @@ mod tests {
             segments.push(Arc::new(Segment::open(&path).unwrap()));
             all.extend(rows);
         }
-        let buffer: Vec<Record> = (0..300)
+        let buffer: Vec<Arc<Record>> = (0..300)
             .map(|_| {
                 let ts = rng.below(20_000) as i64;
-                random_record(&mut rng, ts)
+                Arc::new(random_record(&mut rng, ts))
             })
             .collect();
-        all.extend(buffer.iter().cloned());
+        all.extend(buffer.iter().map(|r| Record::clone(r)));
 
         let groups = [
             GroupBy::Field("host".into()),
