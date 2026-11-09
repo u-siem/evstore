@@ -649,52 +649,91 @@ pub(crate) fn may_match(plan: &Plan, seg: &Segment, chunk: usize) -> bool {
     }
 }
 
+/// Rows of a segment selected by the index phase.
+pub(crate) struct Candidates {
+    /// Segment row numbers that may match.
+    pub rows: RoaringBitmap,
+    /// The rows are exactly the matches: no row needs evaluating.
+    pub exact: bool,
+}
+
 /// Index phase: rows that may match according to postings, or `None` when
 /// the postings cannot narrow the plan (every row is a candidate).
-pub(crate) fn candidates(plan: &Plan, seg: &Segment) -> Result<Option<RoaringBitmap>> {
+///
+/// A leaf on dictionary fields with postings (and no overflow field) is
+/// answered exactly: a row is in a code's bitmap iff one of its values has
+/// that code, which is what [`eval`] tests. `And` and `Or` are exact when
+/// every child is.
+pub(crate) fn candidates(plan: &Plan, seg: &Segment) -> Result<Option<Candidates>> {
     Ok(match plan {
         Plan::Const(true) | Plan::Not(_) => None,
-        Plan::Const(false) => Some(RoaringBitmap::new()),
+        Plan::Const(false) => Some(Candidates {
+            rows: RoaringBitmap::new(),
+            exact: true,
+        }),
         Plan::And(v) => {
-            let mut acc: Option<RoaringBitmap> = None;
+            let mut acc: Option<Candidates> = None;
+            let mut all_exact = true;
             for p in v {
-                if let Some(c) = candidates(p, seg)? {
-                    acc = Some(match acc {
-                        None => c,
-                        Some(a) => a & c,
-                    });
+                match candidates(p, seg)? {
+                    Some(c) => {
+                        all_exact &= c.exact;
+                        acc = Some(match acc {
+                            None => c,
+                            Some(a) => Candidates {
+                                rows: a.rows & c.rows,
+                                exact: true,
+                            },
+                        });
+                    }
+                    None => all_exact = false,
                 }
             }
-            acc
+            acc.map(|c| Candidates {
+                rows: c.rows,
+                exact: all_exact,
+            })
         }
         Plan::Or(v) => {
-            let mut acc = RoaringBitmap::new();
+            let mut rows = RoaringBitmap::new();
+            let mut exact = true;
             for p in v {
                 match candidates(p, seg)? {
                     None => return Ok(None),
-                    Some(c) => acc |= c,
+                    Some(c) => {
+                        rows |= c.rows;
+                        exact &= c.exact;
+                    }
                 }
             }
-            Some(acc)
+            Some(Candidates { rows, exact })
         }
         Plan::Leaf(leaf) => {
             if leaf.overflow.is_some() {
                 return Ok(None);
             }
-            let mut acc = RoaringBitmap::new();
+            let mut rows = RoaringBitmap::new();
             for f in &leaf.fields {
                 let (Some(m), Some(postings)) = (leaf.codes.get(f), seg.field_postings(*f)?) else {
                     return Ok(None);
                 };
                 for (code, hit) in m.hits.iter().enumerate() {
                     if *hit {
-                        acc |= &postings[code];
+                        rows |= &postings[code];
                     }
                 }
             }
-            Some(acc)
+            Some(Candidates { rows, exact: true })
         }
     })
+}
+
+/// Chunk-local row numbers of `rows` inside chunk `chunk`.
+pub(crate) fn chunk_rows(rows: &RoaringBitmap, seg: &Segment, chunk: usize) -> Vec<usize> {
+    let c = &seg.chunks[chunk];
+    rows.range(c.first_row..c.first_row + c.rows)
+        .map(|r| (r - c.first_row) as usize)
+        .collect()
 }
 
 /// Whether `rows` holds any row of chunk `chunk`.
@@ -859,6 +898,8 @@ pub(crate) struct SegmentScan {
     filter_fields: Vec<u32>,
     time: TimeRange,
     desc: bool,
+    /// Candidate rows from the index phase (`None`: every row).
+    rows: Option<Candidates>,
     /// Remaining chunk indexes, in visiting order (reversed for popping).
     chunks: Vec<usize>,
     ready: std::vec::IntoIter<Record>,
@@ -892,7 +933,7 @@ impl SegmentScan {
                     && may_match(&plan, &seg, *c)
                     && rows
                         .as_ref()
-                        .is_none_or(|r| chunk_has_candidates(r, &seg, *c))
+                        .is_none_or(|r| chunk_has_candidates(&r.rows, &seg, *c))
             })
             .collect();
         if !desc {
@@ -904,6 +945,7 @@ impl SegmentScan {
             filter_fields,
             time,
             desc,
+            rows,
             chunks,
             ready: Vec::new().into_iter(),
             failed: false,
@@ -921,10 +963,24 @@ impl SegmentScan {
         let seg = &self.seg;
         let ts = seg.timestamps(c)?;
         let mut data = ChunkData::new();
-        data.load(seg, c, Some(&self.filter_fields))?;
-        let rows: Vec<usize> = (0..ts.len())
-            .filter(|r| self.time.contains(ts[*r]) && eval(&self.plan, &data, *r))
-            .collect();
+        let rows: Vec<usize> = match &self.rows {
+            // Postings decided every row: only the time range is left.
+            Some(cand) if cand.exact => chunk_rows(&cand.rows, seg, c)
+                .into_iter()
+                .filter(|r| self.time.contains(ts[*r]))
+                .collect(),
+            cand => {
+                data.load(seg, c, Some(&self.filter_fields))?;
+                let keep = |r: &usize| self.time.contains(ts[*r]) && eval(&self.plan, &data, *r);
+                match cand {
+                    Some(cand) => chunk_rows(&cand.rows, seg, c)
+                        .into_iter()
+                        .filter(keep)
+                        .collect(),
+                    None => (0..ts.len()).filter(keep).collect(),
+                }
+            }
+        };
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -941,7 +997,15 @@ impl SegmentScan {
         }
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
-            let mut rec = Record::new(ts[r]);
+            let width = columns
+                .iter()
+                .map(|(_, col, _)| col.range(r).len())
+                .sum::<usize>()
+                + all.overflow.as_ref().map_or(0, |o| o[r].len());
+            let mut rec = Record {
+                ts: ts[r],
+                fields: Vec::with_capacity(width),
+            };
             for (name, col, dict) in &columns {
                 for i in col.range(r) {
                     rec.fields.push(((*name).clone(), col.value(i, *dict)));
@@ -979,6 +1043,45 @@ impl Iterator for SegmentScan {
                 }
             }
         }
+    }
+}
+
+/// A [`SegmentScan`] planned on first use: a merge that never reaches the
+/// segment never reads its dictionaries or postings. A planning error is
+/// yielded once, then the scan ends.
+struct LazyScan {
+    /// Segment still to plan (`None` once planned).
+    seg: Option<Arc<Segment>>,
+    filter: Arc<Filter>,
+    time: TimeRange,
+    desc: bool,
+    scan: Option<SegmentScan>,
+}
+
+impl LazyScan {
+    /// A metadata-only bound: never later (in visiting order) than the
+    /// first record the scan can produce, so the merge opens it in time.
+    fn bound(seg: &Segment, time: TimeRange, desc: bool) -> i64 {
+        if desc {
+            let end = time.end.map_or(i64::MAX, |e| e.saturating_sub(1));
+            seg.ts_max.min(end)
+        } else {
+            seg.ts_min.max(time.start.unwrap_or(i64::MIN))
+        }
+    }
+}
+
+impl Iterator for LazyScan {
+    type Item = Result<Record>;
+
+    fn next(&mut self) -> Option<Result<Record>> {
+        if let Some(seg) = self.seg.take() {
+            match SegmentScan::new(seg, &self.filter, self.time, self.desc) {
+                Ok(scan) => self.scan = scan,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        self.scan.as_mut()?.next()
     }
 }
 
@@ -1116,15 +1219,27 @@ pub(crate) fn execute(
     segments: &[Arc<Segment>],
     buffer: &[Arc<Record>],
     query: &Query,
-) -> Result<RecordIter> {
+) -> RecordIter {
     let desc = query.order == Order::Desc;
     let mut sources: Vec<(i64, Source)> = Vec::new();
+    // Segments are planned lazily, when the merge (or the storage-order
+    // chain) first reaches them; only the time overlap is checked here.
+    let filter = Arc::new(query.filter.clone());
     for seg in segments {
-        if let Some(scan) = SegmentScan::new(Arc::clone(seg), &query.filter, query.time, desc)?
-            && let Some(bound) = scan.bound()
-        {
-            sources.push((bound, Box::new(scan)));
+        if !query.time.overlaps(seg.ts_min, seg.ts_max) {
+            continue;
         }
+        let bound = LazyScan::bound(seg, query.time, desc);
+        sources.push((
+            bound,
+            Box::new(LazyScan {
+                seg: Some(Arc::clone(seg)),
+                filter: Arc::clone(&filter),
+                time: query.time,
+                desc,
+                scan: None,
+            }),
+        ));
     }
     // Buffered matches are shared, not copied: each record is cloned only
     // when the merge emits it.
@@ -1151,10 +1266,10 @@ pub(crate) fn execute(
     } else {
         Box::new(Merge::new(sources, desc))
     };
-    Ok(match query.limit {
+    match query.limit {
         Some(n) => Box::new(iter.take(n)),
         None => iter,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -1450,7 +1565,6 @@ pub(crate) mod tests {
                 limit: None,
             };
             let got: Vec<Record> = execute(&segments, &buffer, &query)
-                .unwrap()
                 .map(Result::unwrap)
                 .collect();
             let rf = RecordFilter::new(&filter);
@@ -1479,6 +1593,24 @@ pub(crate) mod tests {
             want.sort_unstable();
             assert_eq!(ids, want, "query {i}: {filter:?} {time:?}");
 
+            // Newest first is exactly oldest first reversed, ties included.
+            if order != Order::Storage {
+                let flip = Query {
+                    order: if order == Order::Asc {
+                        Order::Desc
+                    } else {
+                        Order::Asc
+                    },
+                    ..query.clone()
+                };
+                let mut flipped: Vec<u64> = execute(&segments, &buffer, &flip)
+                    .map(|r| rid(&r.unwrap()))
+                    .collect();
+                flipped.reverse();
+                let ids: Vec<u64> = got.iter().map(rid).collect();
+                assert_eq!(ids, flipped, "query {i}: desc is not asc reversed");
+            }
+
             // Limit pushdown returns a prefix of the full ordered result.
             if order != Order::Storage {
                 let limited: Vec<i64> = execute(
@@ -1489,7 +1621,6 @@ pub(crate) mod tests {
                         ..query.clone()
                     },
                 )
-                .unwrap()
                 .map(|r| r.unwrap().ts)
                 .collect();
                 assert_eq!(
@@ -1511,7 +1642,9 @@ pub(crate) mod tests {
                     (_, 0) => "a",
                     _ => "z",
                 };
-                Record::new(i).with("v", Value::Str(v.into()))
+                Record::new(i)
+                    .with("v", Value::Str(v.into()))
+                    .with("n", Value::I64(i))
             })
             .collect();
         let path = dir.path().join(segment_file_name(1));
@@ -1522,8 +1655,49 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(scan.chunks, vec![2]);
+        assert!(scan.rows.as_ref().is_some_and(|r| r.exact));
         let expected = (8192..12_288).filter(|i| i % 7 == 3).count();
         assert_eq!(scan.count(), expected);
+
+        // Exact postings combined with an unindexed leaf: candidates still
+        // narrow the rows, but every candidate is evaluated.
+        let half = Filter::And(vec![
+            filter.clone(),
+            Filter::field(
+                "n",
+                FieldOp::Range {
+                    lower: Some((Value::I64(10_000), true)),
+                    upper: None,
+                },
+            ),
+        ]);
+        let scan = SegmentScan::new(Arc::clone(&seg), &half, TimeRange::ALL, false)
+            .unwrap()
+            .unwrap();
+        assert!(scan.rows.as_ref().is_some_and(|r| !r.exact));
+        let expected = (10_000..12_288).filter(|i| i % 7 == 3).count();
+        assert_eq!(scan.count(), expected);
+
+        // Exact counts come from the bitmaps, with or without a time cut.
+        for time in [
+            TimeRange::ALL,
+            TimeRange {
+                start: Some(9000),
+                end: Some(12_000),
+            },
+        ] {
+            let q = crate::AggQuery {
+                time,
+                filter: filter.clone(),
+                group_by: vec![],
+                metrics: vec![crate::Metric::Count],
+            };
+            let rows = crate::aggregate::aggregate(std::slice::from_ref(&seg), &[], &q).unwrap();
+            let want = (8192..12_288)
+                .filter(|i| i % 7 == 3 && time.contains(*i))
+                .count() as u64;
+            assert_eq!(rows[0].metrics, vec![crate::MetricValue::Count(want)]);
+        }
         // OR with an unindexed leaf keeps every chunk.
         let either = Filter::Or(vec![filter, Filter::field("w", FieldOp::Exists)]);
         let scan = SegmentScan::new(seg, &either, TimeRange::ALL, false)

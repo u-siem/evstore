@@ -20,7 +20,17 @@ with no prefix (`0.1.0`).
 - Searches share the matching records of the in-memory buffer instead of
   copying them all; a record is cloned only when it is emitted (a
   newest-first query with a limit no longer copies the whole buffer).
-- `benches/query.rs`: query and aggregation benchmarks (`cargo bench`).
+- `benches/query.rs`: query and aggregation benchmarks (`cargo bench`),
+  with a first-run column (segments planned cold).
+- Searches plan segments lazily, when the iteration first reaches them: a
+  newest-first query with a limit never reads the dictionaries or postings
+  of older segments. Planning errors now arrive through the iterator, so
+  `Store::search` currently always returns `Ok`.
+- Postings narrow scans to candidate rows, not just chunks. When they
+  decide a filter exactly (dictionary fields with postings, combined with
+  `And`/`Or`), rows are not re-evaluated and filter columns are not
+  decoded; a `Count` with such a filter is answered from the bitmaps.
+- Materialized records are allocated at their final size.
 
 ### Fixed
 

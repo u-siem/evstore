@@ -331,11 +331,12 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Corrupt`] or [`StoreError::Io`] when a segment
-    /// dictionary or index needed to plan the query cannot be read; errors
-    /// while scanning are yielded by the iterator, which then ends.
+    /// None at the moment. Segments are planned lazily, when the iteration
+    /// first reaches them, so [`StoreError::Corrupt`] or [`StoreError::Io`]
+    /// for an unreadable dictionary, index or block is yielded by the
+    /// iterator (a segment the query never reaches is never read).
     pub fn search(&self, query: &Query) -> Result<RecordIter> {
-        query::execute(&self.segments, &self.buffer, query)
+        Ok(query::execute(&self.segments, &self.buffer, query))
     }
 
     /// Runs an aggregation (see [`AggQuery`](crate::AggQuery)). Row order
@@ -1006,6 +1007,48 @@ mod tests {
         let report = s.maintain(5 * DAY_NS).unwrap();
         assert_eq!(report.pending_deletes, 0);
         assert_eq!(s.pending_deletes(), 0);
+    }
+
+    #[test]
+    fn segments_are_planned_only_when_reached() {
+        let dir = TempDir::new("store-lazy");
+        {
+            let mut s = Store::open(dir.path(), small()).unwrap();
+            s.append((0..100).map(rec).collect()).unwrap();
+            s.flush().unwrap();
+            s.append((100..200).map(rec).collect()).unwrap();
+            s.flush().unwrap();
+        }
+        // Corrupt the last block before the footer of the older segment:
+        // its `host` dictionary, which planning a `host` filter reads. The
+        // footer stays valid, so the store still opens.
+        let mut segs: Vec<PathBuf> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "evs"))
+            .collect();
+        segs.sort();
+        let mut bytes = fs::read(&segs[0]).unwrap();
+        let tail = bytes.len() - 20;
+        let footer = u64::from_le_bytes(bytes[tail..tail + 8].try_into().unwrap());
+        bytes[usize::try_from(footer).unwrap() - 1] ^= 0xff;
+        fs::write(&segs[0], bytes).unwrap();
+
+        let s = Store::open(dir.path(), small()).unwrap();
+        let newest = Query {
+            filter: Filter::field("host", FieldOp::Eq(Value::Str("HOST1".into()))),
+            order: Order::Desc,
+            limit: Some(5),
+            ..Query::default()
+        };
+        let got: Vec<i64> = s.search(&newest).unwrap().map(|r| r.unwrap().ts).collect();
+        assert_eq!(got, vec![197, 193, 189, 185, 181]);
+        // Reaching the corrupt segment reports it through the iterator.
+        let first = s.search(&Query::default()).unwrap().next().unwrap();
+        assert!(
+            matches!(first, Err(StoreError::Corrupt { .. })),
+            "{first:?}"
+        );
     }
 
     #[test]

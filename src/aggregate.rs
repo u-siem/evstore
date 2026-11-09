@@ -35,7 +35,7 @@ use crate::codec::{Reader, get_tagged, put_tagged};
 use crate::error::{Result, StoreError};
 use crate::model::{Record, Value, ValueType, compare};
 use crate::query::{
-    ChunkData, Filter, Plan, RecordFilter, TimeRange, candidates, chunk_has_candidates,
+    ChunkData, Filter, Plan, RecordFilter, TimeRange, candidates, chunk_has_candidates, chunk_rows,
     collect_fields, compile, eval, may_match,
 };
 use crate::registry::OVERFLOW_FIELD;
@@ -339,12 +339,14 @@ fn aggregate_segment(seg: &Arc<Segment>, q: &AggQuery, groups: &mut Groups) -> R
                 && may_match(&plan, seg, *c)
                 && rows
                     .as_ref()
-                    .is_none_or(|r| chunk_has_candidates(r, seg, *c))
+                    .is_none_or(|r| chunk_has_candidates(&r.rows, seg, *c))
         })
         .collect();
+    // Postings that decide the filter exactly make `eval` unnecessary.
+    let exact = rows.as_ref().is_some_and(|r| r.exact);
 
-    // Counting everything needs no column at all.
-    let count_only = matches!(plan, Plan::Const(true))
+    // Counting everything (or exactly indexed rows) needs no column at all.
+    let count_only = (matches!(plan, Plan::Const(true)) || exact)
         && q.group_by.is_empty()
         && q.metrics.iter().all(|m| *m == Metric::Count);
 
@@ -371,7 +373,9 @@ fn aggregate_segment(seg: &Arc<Segment>, q: &AggQuery, groups: &mut Groups) -> R
         return Ok(());
     }
     let mut wanted = Vec::new();
-    collect_fields(&plan, &mut wanted);
+    if !exact {
+        collect_fields(&plan, &mut wanted);
+    }
     group_fields.iter().flatten().for_each(|f| wanted.extend(f));
     for f in &metric_fields {
         wanted.extend(f);
@@ -384,11 +388,13 @@ fn aggregate_segment(seg: &Arc<Segment>, q: &AggQuery, groups: &mut Groups) -> R
     for c in chunks {
         let meta = &seg.chunks[c];
         if count_only && q.time.contains(meta.ts_min) && q.time.contains(meta.ts_max) {
-            let accs = q
-                .metrics
-                .iter()
-                .map(|_| Acc::Count(u64::from(meta.rows)))
-                .collect();
+            let n = match &rows {
+                Some(r) => r
+                    .rows
+                    .range_cardinality(meta.first_row..meta.first_row + meta.rows),
+                None => u64::from(meta.rows),
+            };
+            let accs = q.metrics.iter().map(|_| Acc::Count(n)).collect();
             merge_local(&mut local, Vec::new(), accs);
             continue;
         }
@@ -396,8 +402,13 @@ fn aggregate_segment(seg: &Arc<Segment>, q: &AggQuery, groups: &mut Groups) -> R
         let mut data = ChunkData::new();
         data.load(seg, c, Some(&wanted))?;
         let mut key = Vec::with_capacity(q.group_by.len());
-        'rows: for (row, &t) in ts.iter().enumerate() {
-            if !q.time.contains(t) || !eval(&plan, &data, row) {
+        let row_list: Vec<usize> = match &rows {
+            Some(r) => chunk_rows(&r.rows, seg, c),
+            None => (0..ts.len()).collect(),
+        };
+        'rows: for row in row_list {
+            let t = ts[row];
+            if !q.time.contains(t) || (!exact && !eval(&plan, &data, row)) {
                 continue;
             }
             key.clear();

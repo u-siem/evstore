@@ -84,15 +84,19 @@ fn median(mut samples: Vec<Duration>) -> Duration {
     samples[samples.len() / 2]
 }
 
-fn time<T>(runs: usize, mut f: impl FnMut() -> T) -> (Duration, T) {
-    let mut out = f(); // warm-up (dictionaries, postings, page cache)
+/// (first run, median of the next `runs`, result). The first run plans
+/// segments cold (dictionaries and postings not yet decoded).
+fn time<T>(runs: usize, mut f: impl FnMut() -> T) -> (Duration, Duration, T) {
+    let t = Instant::now();
+    let mut out = f();
+    let first = t.elapsed();
     let mut samples = Vec::with_capacity(runs);
     for _ in 0..runs {
         let t = Instant::now();
         out = black_box(f());
         samples.push(t.elapsed());
     }
-    (median(samples), out)
+    (first, median(samples), out)
 }
 
 fn str_eq(field: &str, v: &str) -> Filter {
@@ -111,7 +115,7 @@ fn main() {
         flush_bytes: usize::MAX,
         ..Options::default()
     };
-    let mut store = Store::open(&dir, opts).expect("open store");
+    let mut store = Store::open(&dir, opts.clone()).expect("open store");
     let mut rng = Rng(0x00be_ac4e);
     let mut ts = 1_700_000_000_000_000_000i64;
     let build = Instant::now();
@@ -207,6 +211,10 @@ fn main() {
             ),
         ),
         (
+            "true, storage, all (materialize everything)",
+            search(Filter::True, Order::Storage, None),
+        ),
+        (
             "cidr /24 (src)",
             search(
                 Filter::field(
@@ -263,10 +271,14 @@ fn main() {
         ),
     ];
 
-    println!("| query | median | rows |");
-    println!("|---|---:|---:|");
+    // Each query starts on a freshly opened store, so "first" includes
+    // decoding the dictionaries and postings it needs.
+    println!("| query | first | median | rows |");
+    println!("|---|---:|---:|---:|");
     for (name, q) in &searches {
-        let (d, n) = time(runs, || {
+        drop(store);
+        store = Store::open(&dir, opts.clone()).expect("reopen store");
+        let (first, d, n) = time(runs, || {
             let mut n = 0usize;
             for r in store.search(q).expect("search") {
                 black_box(r.expect("record"));
@@ -274,11 +286,13 @@ fn main() {
             }
             n
         });
-        println!("| {name} | {d:.2?} | {n} |");
+        println!("| {name} | {first:.2?} | {d:.2?} | {n} |");
     }
     for (name, q) in &aggs {
-        let (d, n) = time(runs, || store.aggregate(q).expect("aggregate").len());
-        println!("| agg: {name} | {d:.2?} | {n} groups |");
+        drop(store);
+        store = Store::open(&dir, opts.clone()).expect("reopen store");
+        let (first, d, n) = time(runs, || store.aggregate(q).expect("aggregate").len());
+        println!("| agg: {name} | {first:.2?} | {d:.2?} | {n} groups |");
     }
 
     drop(store);

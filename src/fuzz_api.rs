@@ -98,9 +98,9 @@ pub fn segment_file(data: Vec<u8>) {
             filter: filter.clone(),
             ..Query::default()
         };
-        if let Ok(iter) = crate::query::execute(&segs, &[], &q) {
-            iter.take(10_000).for_each(drop);
-        }
+        crate::query::execute(&segs, &[], &q)
+            .take(10_000)
+            .for_each(drop);
         let group_by = segs[0]
             .fields
             .first()
