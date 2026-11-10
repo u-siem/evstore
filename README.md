@@ -44,9 +44,15 @@ let newest = Query {
     limit: Some(100),
     ..Query::default()
 };
-for record in store.search(&newest)? { /* ... */ }
+for record in store.search(&newest)? {
+    let record = record?; // the iterator yields Result<Record>
+    /* ... */
+}
 store.maintain(usiem_evstore::now_ns())?; // call every second or so
 ```
+
+[docs/querying.md](docs/querying.md) covers querying in full: filters,
+matching rules, aggregations, and which queries the indexes speed up.
 
 ## Features
 

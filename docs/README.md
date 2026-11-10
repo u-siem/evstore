@@ -18,6 +18,7 @@ Architecture of usiem-evstore at a medium level of detail: the problem, the chos
 | 10 | [Production readiness](design/10-production-readiness.md) | Requirements by area and priority |
 | 11 | [Cost, risks and benchmarks](design/11-cost-risks-benchmarks.md) | Estimates vs baselines, risks R1–R6, experiments to run first, benchmark plan (T7) |
 | 12 | [Risk mitigations](design/12-risk-mitigations.md) | Mitigation design and acceptance thresholds for R1–R6 |
+| — | [Querying a store](querying.md) | User guide to the current API: `Query`, `Filter`/`FieldOp`, matching rules, aggregations, what is pruned and what is scanned |
 | — | [Decisions log](decisions.md) | Every decision taken, in one table |
 | — | [Spikes](spikes/README.md) | Experiments that validate design assumptions, with hardware, results and consequences |
 

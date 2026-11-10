@@ -37,6 +37,12 @@ with no prefix (`0.1.0`).
   every other column the filter doesn't need. Materializing all 420,000
   benchmark records with one field takes 59 ms instead of 273 ms.
 
+### Documentation
+
+- `docs/querying.md`: a guide to querying a store directly (`Query`,
+  `Filter`/`FieldOp`, matching rules, aggregations, inspection, and which
+  queries are pruned or scanned).
+
 ### Fixed
 
 - `FieldOp::Glob`: a `*` in the pattern facing a literal `*` in the text
