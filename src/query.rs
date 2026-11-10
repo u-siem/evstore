@@ -34,7 +34,7 @@
 //! [`crate::aggregate`].
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use roaring::RoaringBitmap;
@@ -219,6 +219,10 @@ pub struct Query {
     pub order: Order,
     /// Maximum number of records.
     pub limit: Option<usize>,
+    /// Fields to return, by exact name (`None`: all). Other fields are
+    /// neither returned nor decoded, unless the filter needs them; overflow
+    /// entries are kept by the same names.
+    pub fields: Option<Vec<String>>,
 }
 
 /// Iterator over query results.
@@ -902,6 +906,9 @@ pub(crate) struct SegmentScan {
     rows: Option<Candidates>,
     /// Remaining chunk indexes, in visiting order (reversed for popping).
     chunks: Vec<usize>,
+    /// Projection: field names to emit and their segment field indexes
+    /// (the overflow field's included); `None` emits every field.
+    proj: Option<(Arc<HashSet<String>>, Vec<u32>)>,
     ready: std::vec::IntoIter<Record>,
     failed: bool,
 }
@@ -947,9 +954,20 @@ impl SegmentScan {
             desc,
             rows,
             chunks,
+            proj: None,
             ready: Vec::new().into_iter(),
             failed: false,
         }))
+    }
+
+    /// Emits only the fields named in `names` (see [`Query::fields`]).
+    pub(crate) fn project(&mut self, names: Arc<HashSet<String>>) {
+        let ids = (0u32..)
+            .zip(&self.seg.fields)
+            .filter(|(_, (name, _))| name == OVERFLOW_FIELD || names.contains(name))
+            .map(|(id, _)| id)
+            .collect();
+        self.proj = Some((names, ids));
     }
 
     /// First timestamp this scan can produce (its next chunk's minimum
@@ -985,11 +1003,15 @@ impl SegmentScan {
             return Ok(Vec::new());
         }
         // Late materialization: decode the remaining columns only now.
-        data.load(seg, c, None)?;
+        let wanted = self.proj.as_ref().map(|(_, ids)| ids.as_slice());
+        data.load(seg, c, wanted)?;
         let all = data;
         let chunk = &seg.chunks[c];
         let mut columns = Vec::with_capacity(chunk.columns.len());
         for meta in &chunk.columns {
+            if wanted.is_some_and(|w| !w.contains(&meta.field)) {
+                continue;
+            }
             if let Some(col) = all.columns.get(&meta.field) {
                 let name = &seg.fields[meta.field as usize].0;
                 columns.push((name, col, seg.field_dict(meta.field)?));
@@ -1012,7 +1034,12 @@ impl SegmentScan {
                 }
             }
             if let Some(over) = &all.overflow {
-                rec.fields.extend(over[r].iter().cloned());
+                match &self.proj {
+                    Some((names, _)) => rec
+                        .fields
+                        .extend(over[r].iter().filter(|(n, _)| names.contains(n)).cloned()),
+                    None => rec.fields.extend(over[r].iter().cloned()),
+                }
             }
             out.push(rec);
         }
@@ -1053,6 +1080,7 @@ struct LazyScan {
     /// Segment still to plan (`None` once planned).
     seg: Option<Arc<Segment>>,
     filter: Arc<Filter>,
+    fields: Option<Arc<HashSet<String>>>,
     time: TimeRange,
     desc: bool,
     scan: Option<SegmentScan>,
@@ -1077,7 +1105,12 @@ impl Iterator for LazyScan {
     fn next(&mut self) -> Option<Result<Record>> {
         if let Some(seg) = self.seg.take() {
             match SegmentScan::new(seg, &self.filter, self.time, self.desc) {
-                Ok(scan) => self.scan = scan,
+                Ok(mut scan) => {
+                    if let (Some(s), Some(names)) = (scan.as_mut(), &self.fields) {
+                        s.project(Arc::clone(names));
+                    }
+                    self.scan = scan;
+                }
                 Err(e) => return Some(Err(e)),
             }
         }
@@ -1225,6 +1258,10 @@ pub(crate) fn execute(
     // Segments are planned lazily, when the merge (or the storage-order
     // chain) first reaches them; only the time overlap is checked here.
     let filter = Arc::new(query.filter.clone());
+    let fields: Option<Arc<HashSet<String>>> = query
+        .fields
+        .as_ref()
+        .map(|f| Arc::new(f.iter().cloned().collect()));
     for seg in segments {
         if !query.time.overlaps(seg.ts_min, seg.ts_max) {
             continue;
@@ -1235,6 +1272,7 @@ pub(crate) fn execute(
             Box::new(LazyScan {
                 seg: Some(Arc::clone(seg)),
                 filter: Arc::clone(&filter),
+                fields: fields.clone(),
                 time: query.time,
                 desc,
                 scan: None,
@@ -1255,11 +1293,22 @@ pub(crate) fn execute(
             mem.reverse();
         }
     }
-    if let Some(first) = mem.first() {
-        sources.push((
-            first.ts,
-            Box::new(mem.into_iter().map(|r| Ok(Record::clone(&r)))),
-        ));
+    if let Some(first) = mem.first().map(|r| r.ts) {
+        let emit: Source = match fields {
+            Some(names) => Box::new(mem.into_iter().map(move |r| {
+                Ok(Record {
+                    ts: r.ts,
+                    fields: r
+                        .fields
+                        .iter()
+                        .filter(|(n, _)| names.contains(n))
+                        .cloned()
+                        .collect(),
+                })
+            })),
+            None => Box::new(mem.into_iter().map(|r| Ok(Record::clone(&r)))),
+        };
+        sources.push((first, emit));
     }
     let iter: RecordIter = if query.order == Order::Storage {
         Box::new(sources.into_iter().flat_map(|(_, s)| s))
@@ -1563,6 +1612,7 @@ pub(crate) mod tests {
                 filter: filter.clone(),
                 order,
                 limit: None,
+                fields: None,
             };
             let got: Vec<Record> = execute(&segments, &buffer, &query)
                 .map(Result::unwrap)
@@ -1610,6 +1660,42 @@ pub(crate) mod tests {
                 let ids: Vec<u64> = got.iter().map(rid).collect();
                 assert_eq!(ids, flipped, "query {i}: desc is not asc reversed");
             }
+
+            // A projection returns the same records, in the same order, with
+            // only the named fields (possibly none).
+            let names: Vec<String> = [
+                "rid", "host", "user", "port", "bytes", "score", "ok", "src", "seen", "message",
+                "blob", "absent",
+            ]
+            .into_iter()
+            .filter(|_| rng.chance(30))
+            .map(str::to_string)
+            .collect();
+            let projected: Vec<Record> = execute(
+                &segments,
+                &buffer,
+                &Query {
+                    fields: Some(names.clone()),
+                    ..query.clone()
+                },
+            )
+            .map(|r| normalize(r.unwrap()))
+            .collect();
+            let want_projected: Vec<Record> = got
+                .iter()
+                .map(|r| {
+                    normalize(Record {
+                        ts: r.ts,
+                        fields: r
+                            .fields
+                            .iter()
+                            .filter(|(n, _)| names.contains(n))
+                            .cloned()
+                            .collect(),
+                    })
+                })
+                .collect();
+            assert_eq!(projected, want_projected, "query {i}: projection {names:?}");
 
             // Limit pushdown returns a prefix of the full ordered result.
             if order != Order::Storage {

@@ -31,6 +31,11 @@ with no prefix (`0.1.0`).
   `And`/`Or`), rows are not re-evaluated and filter columns are not
   decoded; a `Count` with such a filter is answered from the bitmaps.
 - Materialized records are allocated at their final size.
+- **Breaking:** `Query` has a new public field, `fields`, so struct literals
+  need it (or `..Query::default()`). `Some(names)` returns only the fields
+  with those exact names, including overflowed ones, and skips decoding
+  every other column the filter doesn't need. Materializing all 420,000
+  benchmark records with one field takes 59 ms instead of 273 ms.
 
 ### Fixed
 

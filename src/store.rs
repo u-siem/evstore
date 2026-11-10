@@ -916,6 +916,38 @@ mod tests {
             1
         );
         assert_eq!(find(Filter::field(OVERFLOW_FIELD, FieldOp::Exists)), 0);
+
+        // A projection keeps named fields, overflowed or not, sealed or
+        // buffered.
+        let mut s = s;
+        let buffered = Record::new(2)
+            .with("a", Value::Str("y".into()))
+            .with("c", Value::Str("z".into()))
+            .with("e", Value::Bool(true));
+        s.append(vec![buffered]).unwrap();
+        let projected: Vec<Record> = s
+            .search(&Query {
+                fields: Some(vec!["c".into(), "a".into()]),
+                ..Query::default()
+            })
+            .unwrap()
+            .map(|r| {
+                let mut r = r.unwrap();
+                r.fields.sort_by(|a, b| a.0.cmp(&b.0));
+                r
+            })
+            .collect();
+        assert_eq!(
+            projected,
+            vec![
+                Record::new(1)
+                    .with("a", Value::Str("x".into()))
+                    .with("c", Value::Str("Overflowed".into())),
+                Record::new(2)
+                    .with("a", Value::Str("y".into()))
+                    .with("c", Value::Str("z".into())),
+            ]
+        );
         let other = TempDir::new("store-reserved");
         let mut s2 = Store::open(other.path(), small()).unwrap();
         let bad = Record::new(1).with(OVERFLOW_FIELD, Value::Bool(true));

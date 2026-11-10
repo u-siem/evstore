@@ -143,6 +143,7 @@ fn main() {
         filter,
         order,
         limit,
+        fields: None,
     };
     let searches: Vec<(&str, Query)> = vec![
         (
@@ -213,6 +214,13 @@ fn main() {
         (
             "true, storage, all (materialize everything)",
             search(Filter::True, Order::Storage, None),
+        ),
+        (
+            "true, storage, all, fields [host]",
+            Query {
+                fields: Some(vec!["host".into()]),
+                ..search(Filter::True, Order::Storage, None)
+            },
         ),
         (
             "cidr /24 (src)",
